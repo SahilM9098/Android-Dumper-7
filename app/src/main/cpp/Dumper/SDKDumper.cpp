@@ -1,9 +1,10 @@
 // =============================================================================
 // Dumper/SDKDumper.cpp
 // -----------------------------------------------------------------------------
-// Iteration 1: foundation only. Headers contain class declarations + super
-// chains + forward decls + enum stubs. Property and function bodies are
-// `// TODO` placeholders; iteration 2 fills them in.
+// Generates complete SDK headers and out-of-line function implementation files.
+// Walk through reflection objects, topologically sort packages, and emit
+// classes, structs, enums, parameter frames, and ProcessEvent/direct native
+// call wrapper functions.
 // =============================================================================
 
 #include "SDKDumper.h"
@@ -136,12 +137,9 @@ std::atomic<bool>   g_running{false};
 std::atomic<bool>   g_cancel{false};
 std::thread         g_worker;
 
-// Per-dump map: enum UObject address -> smallest observed property size (in bytes)
-// that references the enum. Used to cap an enum's underlying type so it matches
-// the actual storage size of fields that hold enum values (e.g. a 1-byte
-// ByteProperty backed by an enum whose entry values happen to span into
-// int64 territory must still be declared as uint8_t to satisfy the parameter
-// struct's static_assert). Cleared at the start of each dump.
+// Maps an enum's address to its smallest observed field storage size (in bytes).
+// Capping the enum's underlying type to match this storage size ensures
+// parameters and struct fields have correct compile-time offsets and alignment.
 std::unordered_map<uintptr_t, int32_t> g_enumSizeHints;
 std::mutex                              g_enumSizeHintsMutex;
 
@@ -374,10 +372,9 @@ INTERNAL std::string SanitizeIdent(const std::string& name) noexcept;
 INTERNAL std::string CppStringLiteral(const std::string& s) noexcept;
 
 // =============================================================================
-// FProperty / FField walking. Offsets are populated by StructOffsetFinder's
-// advanced pass before dumping. Subclass-specific payload fields begin at
-// Off::FProperty::Size / Off::UProperty::Size; object, struct and container
-// property types are resolved from that runtime base.
+// Helper structures and methods to traverse FProperty and UProperty chains.
+// Uses runtime offset layouts discovered by StructOffsetFinder to resolve types,
+// sizes, and offsets.
 // =============================================================================
 
 struct PropertyInfo {
@@ -862,9 +859,8 @@ INTERNAL void CollectPropertyTypeTargets(
     }
 }
 
-// Detected sizes for variable-size types (FText, FSoftObjectPath, etc.).
-// Set from property elementSize during collection, used by ExpectedCppSizeForType
-// and WriteContainersHpp to emit correct sizes.
+// Dynamic sizes detected from reflection data for standard UE types.
+// Used during header generation to ensure sizes match the active game engine.
 INTERNAL struct DetectedSdkSizes {
     int32_t text = 0;
     int32_t softObjectPath = 0;
@@ -911,8 +907,7 @@ INTERNAL std::vector<PropertyInfo> CollectStructProperties(
         p.typeName = ResolveTypeName(propAddr, clsName, byAddr,
                                      fieldClassCache, 0, legacyProperty);
 
-        // Record the size hint for any enum this property references, so the
-        // enum's underlying type can be capped to match actual field storage.
+        // Track the storage size of enums to align the generated enum's underlying type.
         if (p.enumTarget != 0 && p.elementSize > 0 && p.elementSize <= 8) {
             std::lock_guard<std::mutex> lock(g_enumSizeHintsMutex);
             auto it = g_enumSizeHints.find(p.enumTarget);
@@ -921,9 +916,7 @@ INTERNAL std::vector<PropertyInfo> CollectStructProperties(
             }
         }
 
-        // Detect opaque support type sizes from property elementSize. These
-        // are emitted in Containers.hpp, so their generated size must follow
-        // the current game's reflection data.
+        // Detect standard type sizes to emit correctly in Containers.hpp.
         if (clsName == "TextProperty") {
             AcceptDetectedSize(g_detectedSizes.text, p.elementSize);
         } else if (clsName == "SoftObjectProperty" ||
@@ -1039,17 +1032,11 @@ INTERNAL std::vector<PropertyInfo> CollectStructProperties(
     return props;
 }
 
-// Known sizes for types the dumper hardcodes in Containers.hpp. When the
-// game's reported elementSize doesn't match the expected sizeof, the field
-// must be emitted as a raw byte array so member offsets stay correct in the
-// generated SDK — otherwise static_assert(offsetof(...)) will fire.
-//
-// Detected sizes are set from property elementSize during collection,
-// used by ExpectedCppSizeForType to return accurate sizes for the current game.
+// Returns the expected C++ size for built-in UE types.
+// If the game's actual element size differs from our expected size, the field is
+// emitted as a raw byte array to maintain correct member alignment.
 
-// Returns 0 for types whose size comes from elsewhere (user structs, enums,
-// pointers, templates). For those, the caller trusts the typed emission
-// because reflection / declared types already dictate the correct size.
+// Returns 0 for custom classes, structs, enums, and pointers, which are handled dynamically.
 INTERNAL int32_t ExpectedCppSizeForType(const std::string& typeName) noexcept {
     if (typeName.empty()) return 0;
 
@@ -1105,18 +1092,16 @@ INTERNAL int32_t ExpectedCppSizeForType(const std::string& typeName) noexcept {
     return 0;
 }
 
-// True when the resolved C++ type's known sizeof does NOT match the game's
-// reported element size. In that case the caller must emit the field as a
-// raw byte blob to keep member offsets aligned with what the game expects.
+// Checks if the C++ type's size mismatches the game's reflected element size.
+// If so, the field must be emitted as a byte array to preserve layout.
 INTERNAL bool IsTypeSizeMismatch(const std::string& typeName,
                                  int32_t elementSize) noexcept {
     const int32_t expected = ExpectedCppSizeForType(typeName);
     return expected > 0 && elementSize > 0 && expected != elementSize;
 }
 
-// Emit fields for one struct/class body, padding from baseSize to first prop,
-// between props, and final pad to total. BoolProperty bit masks are emitted as
-// real one-bit fields so every packed bool remains addressable in generated SDKs.
+// Generates struct/class fields with padding.
+// Emits bool properties as bitfields to preserve layout and allow direct access.
 INTERNAL void EmitFields(std::ofstream& f,
                          const std::vector<PropertyInfo>& props,
                          int32_t baseSize,
@@ -2134,8 +2119,7 @@ INTERNAL bool DecodeArm64UnsignedLoad(uint32_t ins,
                                       uint32_t& rn,
                                       uint32_t& rt,
                                       uint32_t& offset) noexcept {
-    // LDR[B/H/W/X] unsigned immediate. Android target is arm64-only for this
-    // dumper, and ProcessEvent normally reads UFunction fields from x1.
+    // Decodes ARM64 LDR (unsigned immediate) instruction.
     if ((ins & 0x3B000000u) != 0x39000000u) return false;
     if ((ins & (1u << 22)) == 0) return false;  // store, not load
     const uint32_t size = (ins >> 30) & 0x3u;
@@ -2149,8 +2133,7 @@ INTERNAL bool DecodeArm64UnsignedLoad(uint32_t ins,
 INTERNAL bool DecodeArm64DirectBranch(uintptr_t pc,
                                       uint32_t ins,
                                       uintptr_t& target) noexcept {
-    // Direct unconditional B. Do not follow BL here; a real function can start
-    // with a call, but a vtable thunk usually starts with a plain branch.
+    // Decodes ARM64 unconditional branch (B). Skip branch-with-link (BL).
     if ((ins & 0xFC000000u) != 0x14000000u) return false;
     int32_t imm26 = static_cast<int32_t>(ins & 0x03FFFFFFu);
     if (imm26 & 0x02000000) imm26 |= static_cast<int32_t>(0xFC000000u);
@@ -2191,8 +2174,7 @@ INTERNAL bool DecodeArm64MovReg(uint32_t ins,
 INTERNAL bool DecodeArm64TestBit(uint32_t ins,
                                  uint32_t& rt,
                                  uint32_t& bit) noexcept {
-    // TBZ/TBNZ. UE ProcessEvent commonly tests FunctionFlags bits, which is
-    // the arm64 equivalent of Dumper-7's x64 FunctionFlags test patterns.
+    // Decodes ARM64 TBZ/TBNZ instructions used to test FunctionFlags bits.
     if ((ins & 0x7E000000u) != 0x36000000u) return false;
     rt = ins & 0x1Fu;
     bit = ((ins >> 19) & 0x1Fu) | ((ins >> 26) & 0x20u);
@@ -2204,7 +2186,7 @@ INTERNAL int32_t ScoreProcessEventCode(uintptr_t fn) noexcept {
     if (!IsExecutableCodeAddress(fn, sizeof(uint32_t))) return 0;
 
     bool aliasOfFunctionArg[32] = {};
-    aliasOfFunctionArg[1] = true;  // x1 = UFunction* for UObject::ProcessEvent
+    aliasOfFunctionArg[1] = true;  // x1 holds UFunction* in ProcessEvent
     bool functionFlagsReg[32] = {};
 
     bool sawFlags = false;
@@ -2223,8 +2205,7 @@ INTERNAL int32_t ScoreProcessEventCode(uintptr_t fn) noexcept {
             if (!insOpt) return;
             const uint32_t ins = *insOpt;
 
-            // RET. Stop at the first function end if we reach it before the
-            // max scan window.
+            // Stop scanning at RET instruction.
             if ((ins & 0xFFFFFC1Fu) == 0xD65F0000u) return;
 
             uint32_t rd = 0, rm = 0;
@@ -2239,8 +2220,8 @@ INTERNAL int32_t ScoreProcessEventCode(uintptr_t fn) noexcept {
             uint32_t testReg = 0, testBit = 0;
             if (DecodeArm64TestBit(ins, testReg, testBit)) {
                 if (testReg < 32 && functionFlagsReg[testReg]) {
-                    if (testBit == 10) sawNativeFlagTest = true;      // FUNC_Native 0x00000400
-                    if (testBit == 22) sawOutParmsFlagTest = true;    // FUNC_HasOutParms 0x00400000
+                    if (testBit == 10) sawNativeFlagTest = true;      // FUNC_Native
+                    if (testBit == 22) sawOutParmsFlagTest = true;    // FUNC_HasOutParms
                 }
                 continue;
             }
@@ -2409,9 +2390,7 @@ INTERNAL bool ResolveProcessEventVTableByHeuristic() noexcept {
     Candidate best;
     SafeMemory::ScopedSigSegvGuard guard;
 
-    // Stock UE4/UE5 arm64 commonly lands in the 0x43..0x45 range depending on
-    // engine branch/game patches. The wider window lets the code-shape score
-    // win if a game shifts the vtable around.
+    // Scan typical UE vtable ranges for ProcessEvent (usually 0x43 to 0x45).
     constexpr int32_t kKnownMin = 0x43;
     constexpr int32_t kKnownMax = 0x45;
     constexpr int32_t kKnownCenter = 0x44;
@@ -2585,13 +2564,8 @@ INTERNAL void ResolveSdkExtraOffsets() noexcept {
           Off::Resolved::ProcessEventVTableIndex,
           Off::Discovery::ProcessEventMethod);
 
-    // --- Auto-detect ULevel::Actors offset ---
-    // ULevel::Actors is a TArray<AActor*> that's NOT reflected (no UPROPERTY).
-    // We find it by:
-    //   1. Reading GWorld to get the current UWorld
-    //   2. Scanning UWorld's memory for a pointer to a ULevel (class == "Level")
-    //   3. Scanning ULevel's memory for a TArray pattern where elements are
-    //      valid UObject pointers with class inheriting from "Actor"
+    // Auto-detect non-reflected ULevel::Actors offset by scanning UWorld for 
+    // a ULevel, then scanning ULevel for a valid TArray<AActor*> pattern.
     if (Off::Resolved::GWorld != 0) {
         SafeMemory::ScopedSigSegvGuard guard;
         guard.Try([&] {
@@ -2600,8 +2574,7 @@ INTERNAL void ResolveSdkExtraOffsets() noexcept {
             if (!worldPtr || *worldPtr == 0) return;
             uintptr_t world = *worldPtr;
 
-            // Scan UWorld for a pointer to a ULevel (PersistentLevel is typically
-            // at offset 0x30-0x100 depending on engine version)
+            // Scan UWorld for a pointer to ULevel.
             uintptr_t levelAddr = 0;
             for (int32_t off = 0x20; off < 0x200; off += 8) {
                 auto candidate = SafeMemory::SafeReadAny<uintptr_t>(world + off);
@@ -2622,10 +2595,7 @@ INTERNAL void ResolveSdkExtraOffsets() noexcept {
             }
             if (levelAddr == 0) return;
 
-            // Scan ULevel memory for TArray<AActor*> pattern.
-            // TArray layout: Data(8) + Num(4) + Max(4) = 16 bytes
-            // We look for: Data != 0, Num in [1..50000], Max >= Num,
-            // and Data[0] is a valid UObject pointer.
+            // Scan ULevel memory for the TArray<AActor*> pattern.
             for (int32_t off = 0x80; off < 0x300; off += 8) {
                 auto data = SafeMemory::SafeReadAny<uintptr_t>(levelAddr + off);
                 auto num  = SafeMemory::SafeReadAny<int32_t>(levelAddr + off + 8);
@@ -2634,15 +2604,14 @@ INTERNAL void ResolveSdkExtraOffsets() noexcept {
                 if (*data == 0 || *num < 5 || *num > 50000) continue;
                 if (*max < *num) continue;
 
-                // Verify first element is a valid UObject (has vtable in libUE4)
+                // Verify first element is a valid UObject.
                 auto firstElem = SafeMemory::SafeReadAny<uintptr_t>(*data);
                 if (!firstElem || *firstElem == 0) continue;
                 auto vtable = SafeMemory::SafeReadAny<uintptr_t>(*firstElem);
                 if (!vtable || *vtable == 0) continue;
                 if (!SafeMemory::IsInLibUE4(*vtable, sizeof(uintptr_t))) continue;
 
-                // Extra check: verify the object's class name contains "Actor"
-                // or is a known actor-derived class
+                // Verify the object inherits from Actor.
                 auto elemCls = SafeMemory::SafeReadAny<uintptr_t>(
                         *firstElem + Off::UObject::ClassPrivate);
                 if (!elemCls || *elemCls == 0) continue;
@@ -2849,11 +2818,7 @@ INTERNAL std::string CleanEnumValueName(const std::string& enumName,
     return out;
 }
 
-// Picks the narrowest underlying integer type that can hold all enum values,
-// optionally capped by `sizeHint` (a byte count reported by a property that
-// references this enum). When `sizeHint` is non-zero, the returned type will
-// not exceed that size even if entry values overflow it — the caller is
-// responsible for masking the values to fit.
+// Picks the narrowest underlying integer type that fits all values, capped by sizeHint.
 INTERNAL const char* EnumUnderlyingType(const std::vector<EnumEntry>& entries,
                                         int32_t sizeHint = 0) noexcept {
     bool fitsU8 = true;
@@ -2865,8 +2830,7 @@ INTERNAL const char* EnumUnderlyingType(const std::vector<EnumEntry>& entries,
         if (e.value < 0 || u > 0xFFFFull) fitsU16 = false;
         if (e.value < -2147483648LL || e.value > 2147483647LL) fitsI32 = false;
     }
-    // When a referencing property fixes the storage size, honor it regardless
-    // of whether the raw entry values fit — values will be masked at emit time.
+    // Honor sizeHint storage cap; values are masked at emit time.
     if (sizeHint == 1) return "uint8_t";
     if (sizeHint == 2) return "uint16_t";
     if (sizeHint == 4) return "uint32_t";
@@ -2912,8 +2876,7 @@ INTERNAL void EmitEnum(std::ofstream& f, const ObjMeta& meta) noexcept {
         while (!used.insert(unique).second) {
             unique = name + "_" + std::to_string(suffix++);
         }
-        // Mask the value if the underlying type was capped by a size hint,
-        // so values beyond the type's range still compile.
+        // Mask the value to fit the sizeHint underlying type.
         int64_t value = entries[i].value;
         if (sizeHint > 0 && sizeHint < 8) {
             value = MaskEnumValueToFit(value, sizeHint);
@@ -2930,9 +2893,7 @@ INTERNAL bool IsCoreUObjectClassName(const std::string& name) noexcept {
 }
 
 INTERNAL bool IsPredefinedStructName(const std::string& name) noexcept {
-    // Only skip support types that Containers.hpp emits as opaque/runtime
-    // helpers. Math structs (Vector, Rotator, Transform, Color, Guid, etc.)
-    // are reflected with useful fields and must still be generated per game.
+    // Skip opaque/support structures defined in Containers.hpp.
     return name == "Text" ||
            name == "WeakObjectPtr" ||
            name == "ScriptInterface" ||
@@ -4385,10 +4346,7 @@ INTERNAL void EmitParamStructBody(std::ofstream& f,
         }
         int32_t fieldSize = static_cast<int32_t>(fieldSize64);
 
-        // Explicit padding between fields to match UE's memory layout.
-        // Can't rely on compiler alignment alone — UE's layout doesn't always
-        // match C++ natural alignment rules (e.g. after a 12-byte struct,
-        // UE might pad to 8-byte boundary differently than the compiler).
+        // Emit explicit padding to align with Unreal Engine's struct layout.
         if (p.offset > cursor) {
             f << "    uint8_t Pad_" << std::hex << std::uppercase << cursor
               << "[0x" << (p.offset - cursor) << "];" << std::dec << "\n";
@@ -4514,11 +4472,8 @@ INTERNAL bool WritePackageParametersHeader(
                       });
 
             const std::string structName = ParamStructNameFromClassAndFunc(className, fn);
-            // Do not trust UStruct::PropertiesSize on UFunction blindly. Some titles
-            // report an undersized value for certain parameter frames (e.g. enum/byte
-            // params), which would make static_asserts fire even when the frame
-            // layout is otherwise correct. Instead compute the frame size from the
-            // highest (offset + elementSize*arrayDim) across all params/return.
+            // Calculate parameter frame size dynamically as UStruct::PropertiesSize
+            // can be undersized in some engine versions.
             int32_t totalSize = fn.paramsSize;
             for (const auto& p : frame) {
                 if (p.offset < 0) continue;
@@ -4587,9 +4542,7 @@ INTERNAL bool WritePackageFunctionsCpp(
     f << "// via vtable index at SDK init), looking up the UFunction* by name\n";
     f << "// using UClass::GetFunction (runtime FindFunction equivalent).\n";
     f << "#include <cstring>\n";
-    // Include only what this translation unit actually needs — NOT the umbrella
-    // SDK.hpp. Pulling in every package for each _functions.cpp is what makes
-    // the SDK build dog-slow (each cpp re-parses tens of thousands of lines).
+    // Include only required headers to speed up C++ compilation.
     //
     // Paths are relative to SDK/Private/ where this .cpp lives.
     f << "#include \"../Public/Basic.hpp\"\n";
@@ -4800,11 +4753,7 @@ INTERNAL bool WriteHeaders(const std::vector<uintptr_t>& order,
     std::unordered_map<uintptr_t, std::string> fieldClassCache;
     fieldClassCache.reserve(64);
 
-    // Pre-scan: collect properties for every struct, class, and function in
-    // the dump so that `g_enumSizeHints` is fully populated before any enum
-    // header is written. Without this, an enum emitted in an early package
-    // would not know about properties in later packages that reference it
-    // with a smaller storage size.
+    // Pre-scan all properties to populate g_enumSizeHints before writing headers.
     {
         std::lock_guard<std::mutex> lock(g_enumSizeHintsMutex);
         g_enumSizeHints.clear();
