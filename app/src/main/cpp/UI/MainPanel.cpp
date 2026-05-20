@@ -803,8 +803,8 @@ INTERNAL void RenderStep(int n, const char* name, const Step& s) noexcept {
 }  // namespace
 
 void Render() noexcept {
-    ImGui::SetNextWindowSize(ImVec2(680.0f, 520.0f), ImGuiCond_Once);
-    
+
+    ImGui::SetNextWindowSize({900.0f,500.0f},ImGuiCond_Once);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
     
     char title[128];
@@ -828,7 +828,9 @@ void Render() noexcept {
     bool sdkRunning = SDKDumper::IsRunning();
 
     ImVec2 contentSize = ImGui::GetContentRegionAvail();
-    float sidebarWidth = 210.0f;
+    ImGuiIO& io = ImGui::GetIO();
+    ImVec2 DisplaySize = io.DisplaySize;
+    float sidebarWidth = contentSize.x * 0.4f;
     float mainWidth = contentSize.x - sidebarWidth - 12.0f;
 
     ImGui::BeginChild("SidebarPanel", ImVec2(sidebarWidth, contentSize.y - 10.0f), true, ImGuiWindowFlags_NoScrollbar);
@@ -855,6 +857,7 @@ void Render() noexcept {
     
     char dumpDirBuf[256];
     std::snprintf(dumpDirBuf, sizeof(dumpDirBuf), "%s", g_dumpDir.c_str());
+    ImGui::SetNextItemWidth(-1.0f);
     ImGui::InputText("##TargetDir", dumpDirBuf, sizeof(dumpDirBuf), ImGuiInputTextFlags_ReadOnly);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("The folder on the device where target C++ SDK headers will be generated.");
@@ -905,6 +908,22 @@ void Render() noexcept {
         gobjects = g_gobjects;
         gnames = g_gnames;
         offsets = g_offsets;
+    }
+
+    // Auto-scroll logic: detect transitions to newer steps to keep the focus on active work
+    static int lastActiveStep = 0;
+    int currentActiveStep = 0;
+    if (lib.state == StepState::Running || lib.state == StepState::Done) currentActiveStep = 1;
+    if (gobjects.state == StepState::Running || gobjects.state == StepState::Done) currentActiveStep = 2;
+    if (gnames.state == StepState::Running || gnames.state == StepState::Done) currentActiveStep = 3;
+    if (offsets.state == StepState::Running || offsets.state == StepState::Done) currentActiveStep = 4;
+    if (sdkRunning) currentActiveStep = 5;
+
+    bool triggerScroll = (currentActiveStep > lastActiveStep);
+    lastActiveStep = currentActiveStep;
+
+    if (!pipelineRunning && !sdkRunning) {
+        lastActiveStep = 0;
     }
 
     RenderStep(1, "Lib & Engine Version Loader", lib);
@@ -987,6 +1006,11 @@ void Render() noexcept {
         ImGui::PopStyleVar(2);
     }
     
+    bool isScrollingNearBottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 25.0f;
+    if (triggerScroll || ((pipelineRunning || sdkRunning) && isScrollingNearBottom)) {
+        ImGui::SetScrollHereY(1.0f);
+    }
+
     ImGui::EndChild();
 
     ImGui::End();
