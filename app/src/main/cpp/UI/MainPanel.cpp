@@ -25,6 +25,7 @@
 #include "Utility.h"
 
 #include "imgui.h"
+#include "IconsFontAwesome7.h"
 
 #include <android/log.h>
 #include <fcntl.h>
@@ -93,19 +94,19 @@ struct IdaOverrides {
 
 INTERNAL ImVec4 ColorFor(StepState s) noexcept {
     switch (s) {
-        case StepState::Done:    return ImVec4(0.40f, 0.85f, 0.45f, 1.0f);
-        case StepState::Failed:  return ImVec4(0.85f, 0.45f, 0.45f, 1.0f);
-        case StepState::Running: return ImVec4(0.85f, 0.75f, 0.40f, 1.0f);
-        default:                 return ImVec4(0.55f, 0.55f, 0.55f, 1.0f);
+        case StepState::Done:    return ImVec4(0.00f, 0.90f, 0.46f, 1.0f); // Glowing Neon Green
+        case StepState::Failed:  return ImVec4(1.00f, 0.09f, 0.27f, 1.0f); // Neon Crimson Red
+        case StepState::Running: return ImVec4(1.00f, 0.84f, 0.00f, 1.0f); // Bright Amber Gold
+        default:                 return ImVec4(0.55f, 0.58f, 0.62f, 1.00f); // Muted Silver Gray
     }
 }
 
 INTERNAL const char* IconFor(StepState s) noexcept {
     switch (s) {
-        case StepState::Done:    return "[OK]";
-        case StepState::Failed:  return "[X] ";
-        case StepState::Running: return "[..]";
-        default:                 return "[ ] ";
+        case StepState::Done:    return ICON_FA_CHECK;
+        case StepState::Failed:  return ICON_FA_XMARK;
+        case StepState::Running: return ICON_FA_CIRCLE_NOTCH;
+        default:                 return ICON_FA_CIRCLE;
     }
 }
 
@@ -724,75 +725,176 @@ INTERNAL void StartPipeline() noexcept {
 
 INTERNAL void RenderStep(int n, const char* name, const Step& s) noexcept {
     ImVec4 col = ColorFor(s.state);
-    ImGui::TextColored(col, "%s  [%d] %s", IconFor(s.state), n, name);
-
+    
+    // Draw step container inside a clean child panel
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 10.0f));
+    
+    float height = 44.0f;
+    if (!s.summary.empty()) height += 20.0f;
+    if (!s.methods.empty()) height += (s.methods.size() * 26.0f) + 16.0f;
+    
+    char childId[64];
+    std::snprintf(childId, sizeof(childId), "step_child_%d", n);
+    
+    ImGui::PushStyleColor(ImGuiCol_Border, col);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.14f, 0.18f, 0.35f));
+    
+    ImGui::BeginChild(childId, ImVec2(0.0f, height), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    
+    ImGui::TextColored(col, "%s  Step %d: %s", IconFor(s.state), n, name);
+    
     if (!s.summary.empty()) {
-        ImGui::Indent(28.0f);
-        ImGui::TextColored(col, "%s", s.summary.c_str());
-        ImGui::Unindent(28.0f);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24.0f);
+        ImGui::TextDisabled("%s", s.summary.c_str());
     }
-
-    // Per-method chain (GUObject + GNames). Skipped methods (chain stopped
-    // earlier) render dimmed; tried methods show success/failure with one-line
-    // notes (address + candidate count + elapsed).
+    
     if (!s.methods.empty()) {
-        ImGui::Indent(28.0f);
-        for (const auto& m : s.methods) {
-            ImVec4 mcol = ColorFor(m.status);
-            const char* tag = "skipped";
-            switch (m.status) {
-                case StepState::Done:    tag = "success"; break;
-                case StepState::Failed:  tag = "failed";  break;
-                case StepState::Running: tag = "running…"; break;
-                default: break;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24.0f);
+        ImGui::Separator();
+        ImGui::Spacing();
+        
+        if (ImGui::BeginTable("methods_table", 3, ImGuiTableFlags_None)) {
+            ImGui::TableSetupColumn("Method", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+            ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+            ImGui::TableSetupColumn("Details", ImGuiTableColumnFlags_WidthStretch);
+            
+            for (const auto& m : s.methods) {
+                ImGui::TableNextRow();
+                ImVec4 mcol = ColorFor(m.status);
+                
+                ImGui::TableNextColumn();
+                ImGui::TextColored(mcol, " %s %s", IconFor(m.status), m.name.c_str());
+                
+                ImGui::TableNextColumn();
+                const char* tag = "skipped";
+                switch (m.status) {
+                    case StepState::Done:    tag = "success"; break;
+                    case StepState::Failed:  tag = "failed";  break;
+                    case StepState::Running: tag = "running..."; break;
+                    default: break;
+                }
+                ImGui::TextColored(mcol, "%s", tag);
+                
+                ImGui::TableNextColumn();
+                std::string note = m.note;
+                if (m.status == StepState::Running &&
+                    (m.name == "CodeRef" || m.name == "CodeRefQuick")) {
+                    std::string progress =
+                            FormatCodeRefProgress(OffsetFinder::CodeRefSnapshot());
+                    if (!progress.empty()) note = progress;
+                }
+                if (!note.empty()) {
+                    ImGui::TextDisabled("%s", note.c_str());
+                } else {
+                    ImGui::TextDisabled("-");
+                }
             }
-            std::string note = m.note;
-            if (m.status == StepState::Running &&
-                (m.name == "CodeRef" || m.name == "CodeRefQuick")) {
-                std::string progress =
-                        FormatCodeRefProgress(OffsetFinder::CodeRefSnapshot());
-                if (!progress.empty()) note = progress;
-            }
-            ImGui::TextColored(mcol, "  %s %-10s %s  %s",
-                               IconFor(m.status), m.name.c_str(), tag,
-                               note.c_str());
+            ImGui::EndTable();
         }
-        ImGui::Unindent(28.0f);
     }
-
+    
+    ImGui::EndChild();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
     ImGui::Spacing();
 }
 
 }  // namespace
 
 void Render() noexcept {
-    ImGui::SetNextWindowSize(ImVec2(620.0f, 460.0f), ImGuiCond_Once);
-    if (!ImGui::Begin("Dumper-7 [Android]")) {
+    ImGui::SetNextWindowSize(ImVec2(680.0f, 520.0f), ImGuiCond_Once);
+    
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+    
+    char title[128];
+    std::snprintf(title, sizeof(title), " %s  Dumper-7 [Android]", ICON_FA_MICROCHIP);
+    if (!ImGui::Begin(title)) {
         ImGui::End();
+        ImGui::PopStyleVar();
         return;
     }
+    ImGui::PopStyleVar();
 
-    ImGui::TextDisabled("One-shot SDK dump. Detailed trace -> logcat tag \"Dumper7\".");
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.00f, 0.75f, 1.00f, 1.0f));
+    ImGui::Text("%s  DUMPER-7 ENGINE", ICON_FA_MICROCHIP);
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    ImGui::TextDisabled("|  Universal Unreal Engine SDK Generator");
     ImGui::Separator();
+    ImGui::Spacing();
 
     bool pipelineRunning = g_pipelineRunning.load();
     bool sdkRunning = SDKDumper::IsRunning();
 
-    ImGui::Text("Output: %s", g_dumpDir.c_str());
+    ImVec2 contentSize = ImGui::GetContentRegionAvail();
+    float sidebarWidth = 210.0f;
+    float mainWidth = contentSize.x - sidebarWidth - 12.0f;
 
-    if (pipelineRunning || sdkRunning) ImGui::BeginDisabled();
-    if (ImGui::Button("DUMP", ImVec2(160.0f, 34.0f))) {
-        StartPipeline();
-    }
-    if (pipelineRunning || sdkRunning) ImGui::EndDisabled();
-    ImGui::SameLine();
+    ImGui::BeginChild("SidebarPanel", ImVec2(sidebarWidth, contentSize.y - 10.0f), true, ImGuiWindowFlags_NoScrollbar);
+    
+    ImGui::TextDisabled("CONFIGURATION");
+    ImGui::Separator();
+    ImGui::Spacing();
+
     ImGui::Checkbox("Direct Calls", &SDKDumper::g_useDirectCalls);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Use native function pointers instead of ProcessEvent.\n"
                           "Faster but only works for C++ (non-Blueprint) functions.");
     }
-    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::Spacing();
 
+    ImGui::TextDisabled("TARGET OUTPUT");
+    ImGui::Separator();
+    ImGui::Spacing();
+    
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.12f, 0.14f, 0.18f, 0.50f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 6.0f));
+    
+    char dumpDirBuf[256];
+    std::snprintf(dumpDirBuf, sizeof(dumpDirBuf), "%s", g_dumpDir.c_str());
+    ImGui::InputText("##TargetDir", dumpDirBuf, sizeof(dumpDirBuf), ImGuiInputTextFlags_ReadOnly);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("The folder on the device where target C++ SDK headers will be generated.");
+    }
+    
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor();
+    
+    ImGui::Spacing();
+    ImGui::Spacing();
+    ImGui::Spacing();
+
+    if (pipelineRunning || sdkRunning) ImGui::BeginDisabled();
+    
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.00f, 0.45f, 0.74f, 0.80f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.00f, 0.55f, 0.90f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.00f, 0.65f, 1.00f, 1.00f));
+    
+    char buttonLabel[64];
+    std::snprintf(buttonLabel, sizeof(buttonLabel), "%s  DUMP SDK", ICON_FA_PLAY);
+    if (ImGui::Button(buttonLabel, ImVec2(sidebarWidth - 16.0f, 40.0f))) {
+        StartPipeline();
+    }
+    
+    ImGui::PopStyleColor(3);
+    
+    if (pipelineRunning || sdkRunning) ImGui::EndDisabled();
+
+    if (pipelineRunning || sdkRunning) {
+        ImGui::Spacing();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 8.0f);
+        ImGui::TextColored(ImVec4(1.00f, 0.84f, 0.00f, 1.0f), "%s Running...", ICON_FA_CIRCLE_NOTCH);
+    }
+    
+    ImGui::EndChild();
+
+    ImGui::SameLine();
+
+    ImGui::BeginChild("MainStatusPanel", ImVec2(mainWidth, contentSize.y - 10.0f), false);
+    
     Step lib;
     Step gobjects;
     Step gnames;
@@ -805,16 +907,14 @@ void Render() noexcept {
         offsets = g_offsets;
     }
 
-    RenderStep(1, "lib + UE version", lib);
-    RenderStep(2, "GUObject", gobjects);
-    RenderStep(3, "GNames", gnames);
-    RenderStep(4, "Object Structure", offsets);
+    RenderStep(1, "Lib & Engine Version Loader", lib);
+    RenderStep(2, "GUObject Scanner", gobjects);
+    RenderStep(3, "GNames Reflection Parser", gnames);
+    RenderStep(4, "Object Properties Alignment", offsets);
 
-    // ---- Step 5: DUMP — special, has its own background thread + progress ----
     {
         auto snap = SDKDumper::Snapshot();
         bool running = sdkRunning;
-        bool gateOpen = offsets.state == StepState::Done;
         bool chainFailed = lib.state == StepState::Failed ||
                            gobjects.state == StepState::Failed ||
                            gnames.state == StepState::Failed ||
@@ -828,31 +928,52 @@ void Render() noexcept {
         else if (snap.phase == SDKDumper::Phase::Cancelled) ds = StepState::Failed;
 
         ImVec4 col = ColorFor(ds);
-        ImGui::TextColored(col, "%s  [5] DUMP", IconFor(ds));
-        (void)gateOpen;
-
-        ImGui::Indent(28.0f);
+        
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 10.0f));
+        ImGui::PushStyleColor(ImGuiCol_Border, col);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.14f, 0.18f, 0.35f));
+        
+        float height = 48.0f;
+        if (running) height += 48.0f;
+        else if (ds == StepState::Done) height += 20.0f;
+        else if (ds == StepState::Failed) height += 20.0f;
+        
+        ImGui::BeginChild("step_child_5", ImVec2(0.0f, height), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        
+        ImGui::TextColored(col, "%s  Step 5: Code SDK Emission", IconFor(ds));
+        
         if (running) {
-            ImGui::TextColored(col,
-                               "%s — %d/%d packages — pkgs:%d cls:%d struct:%d enum:%d fn:%d",
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24.0f);
+            ImGui::TextColored(col, "%s  -  written %d/%d packages",
                                SDKDumper::PhaseName(snap.phase),
-                               snap.writtenPackages, snap.totalPackages,
-                               snap.totalPackages, snap.classCount,
-                               snap.structCount, snap.enumCount, snap.functionCount);
+                               snap.writtenPackages, snap.totalPackages);
+            
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24.0f);
+            ImGui::TextDisabled("Classes: %d  |  Structs: %d  |  Enums: %d  |  Functions: %d",
+                               snap.classCount, snap.structCount, snap.enumCount, snap.functionCount);
+                               
+            ImGui::Spacing();
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24.0f);
+            
+            float pct = 0.0f;
             if (snap.totalPackages > 0 && snap.phase == SDKDumper::Phase::Writing) {
-                float pct = (float)snap.writtenPackages / (float)snap.totalPackages;
-                ImGui::ProgressBar(pct, ImVec2(420.0f, 0.0f));
+                pct = (float)snap.writtenPackages / (float)snap.totalPackages;
             } else if (snap.totalObjects > 0) {
-                float pct = (float)snap.processedObjects / (float)snap.totalObjects;
-                ImGui::ProgressBar(pct, ImVec2(420.0f, 0.0f));
+                pct = (float)snap.processedObjects / (float)snap.totalObjects;
             }
+            
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.00f, 0.75f, 1.00f, 1.00f));
+            ImGui::ProgressBar(pct, ImVec2(mainWidth - 48.0f, 12.0f), "");
+            ImGui::PopStyleColor();
+            
         } else if (ds == StepState::Done) {
-            ImGui::TextColored(col,
-                               "Done in %.2fs — %d packages, %d classes (output: %s)",
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24.0f);
+            ImGui::TextColored(col, "Done in %.2fs  |  %d Packages  |  %d Classes",
                                snap.elapsedMicros / 1e6,
-                               snap.writtenPackages, snap.classCount,
-                               snap.outputDir.c_str());
+                               snap.writtenPackages, snap.classCount);
         } else if (ds == StepState::Failed) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 24.0f);
             const char* msg = chainFailed
                             ? "Skipped because an earlier step failed."
                             : snap.phase == SDKDumper::Phase::Cancelled
@@ -860,8 +981,13 @@ void Render() noexcept {
                             : snap.error.c_str();
             ImGui::TextColored(col, "%s", msg);
         }
-        ImGui::Unindent(28.0f);
+        
+        ImGui::EndChild();
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar(2);
     }
+    
+    ImGui::EndChild();
 
     ImGui::End();
 }
