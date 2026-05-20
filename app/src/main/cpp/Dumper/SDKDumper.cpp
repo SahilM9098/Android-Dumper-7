@@ -4640,6 +4640,234 @@ INTERNAL bool WriteSdkUmbrellaHeader(
     return true;
 }
 
+INTERNAL std::string GetFullObjectName(uintptr_t obj) noexcept {
+    if (obj == 0) return "None";
+    std::string path;
+    uintptr_t cur = obj;
+    SafeMemory::ScopedSigSegvGuard guard;
+    guard.Try([&] {
+        for (int hop = 0; hop < 64; ++hop) {
+            std::string name = ReadObjectName(cur);
+            if (name.empty()) name = "Unnamed";
+            if (path.empty()) {
+                path = name;
+            } else {
+                path = name + "." + path;
+            }
+            uintptr_t outer = ReadOuter(cur);
+            if (outer == 0) break;
+            cur = outer;
+        }
+    });
+    return path;
+}
+
+INTERNAL std::string GetFullFunctionName(uintptr_t fnAddr) noexcept {
+    SafeMemory::ScopedSigSegvGuard guard;
+    std::string path;
+    guard.Try([&] {
+        std::string fnName = ReadObjectName(fnAddr);
+        uintptr_t classAddr = ReadOuter(fnAddr);
+        if (classAddr != 0) {
+            std::string className = ReadObjectName(classAddr);
+            uintptr_t pkgAddr = ReadOuter(classAddr);
+            if (pkgAddr != 0) {
+                std::string pkgName = ReadObjectName(pkgAddr);
+                path = CleanUnrealDisplayPath(pkgName) + "." + className + "." + fnName;
+            } else {
+                path = className + "." + fnName;
+            }
+        } else {
+            path = fnName;
+        }
+    });
+    return path;
+}
+
+INTERNAL bool WriteNamesDump(const std::string& rootDir) noexcept {
+    std::string fname = JoinPath(rootDir, "NamesDump.txt");
+    std::ofstream f(fname);
+    if (!f) {
+        DLOGW("[sdk] failed to open NamesDump.txt");
+        return false;
+    }
+
+    int32_t consecutiveEmpty = 0;
+    for (int32_t blockIndex = 0; blockIndex < 512; ++blockIndex) {
+        if (g_cancel.load()) break;
+        auto entries = UE::NameArray::WalkBlock(blockIndex, 65536);
+        if (entries.empty()) {
+            consecutiveEmpty++;
+            if (consecutiveEmpty > 4) break;
+            continue;
+        }
+        consecutiveEmpty = 0;
+        for (const auto& entry : entries) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "[%08d] ", entry.first);
+            f << buf << entry.second << "\n";
+        }
+    }
+    return true;
+}
+
+INTERNAL bool WriteObjectsDump(const std::string& rootDir) noexcept {
+    std::string fname = JoinPath(rootDir, "ObjectsDump.txt");
+    std::ofstream f(fname);
+    if (!f) {
+        DLOGW("[sdk] failed to open ObjectsDump.txt");
+        return false;
+    }
+
+    f << "Address\t\tIndex\tClass\t\tPath\n";
+    f << "--------------------------------------------------\n";
+
+    SafeMemory::ScopedSigSegvGuard guard;
+    std::unordered_map<uintptr_t, std::string> classNameCache;
+    classNameCache.reserve(1024);
+
+    auto classNameOf = [&](uintptr_t obj) -> std::string {
+        uintptr_t cls = 0;
+        guard.Try([&] { cls = ReadClassPtr(obj); });
+        if (cls == 0) return {};
+        auto it = classNameCache.find(cls);
+        if (it != classNameCache.end()) return it->second;
+        std::string n;
+        guard.Try([&] { n = ReadObjectName(cls); });
+        classNameCache.emplace(cls, n);
+        return n;
+    };
+
+    UE::ObjectArray::ForEach([&](UE::UObject* obj) {
+        if (g_cancel.load()) return;
+        uintptr_t addr = reinterpret_cast<uintptr_t>(obj);
+        std::string clsName = classNameOf(addr);
+        if (clsName.empty()) clsName = "UnknownClass";
+
+        int32_t idx = -1;
+        guard.Try([&] {
+            auto pIdx = SafeMemory::SafeReadAny<int32_t>(addr + Off::UObject::InternalIndex);
+            if (pIdx) idx = *pIdx;
+        });
+
+        std::string fullPath = GetFullObjectName(addr);
+        
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "[0x%llX] (%d) ", (unsigned long long)addr, idx);
+        f << buf << clsName << "\t" << fullPath << "\n";
+    });
+
+    return true;
+}
+
+INTERNAL bool WriteFunctionsLogAndScripts(
+        const std::vector<uintptr_t>& order,
+        const std::unordered_map<uintptr_t, PackageInfo>& packages,
+        const std::unordered_map<uintptr_t, const ObjMeta*>& byAddr,
+        const std::string& rootDir) noexcept {
+    std::string logFname = JoinPath(rootDir, "Functions.log");
+    std::string idapyFname = JoinPath(rootDir, "SDKRename_IDA.py");
+    std::string ghidrapyFname = JoinPath(rootDir, "SDKRename_Ghidra.py");
+    
+    std::ofstream logF(logFname);
+    std::ofstream idapyF(idapyFname);
+    std::ofstream ghidrapyF(ghidrapyFname);
+
+    if (!logF) {
+        DLOGW("[sdk] failed to open Functions.log");
+        return false;
+    }
+
+    logF << "// Universal Android Unreal Engine SDK Dumper — Native Function Offset Registry\n";
+    logF << "// lib.base = " << HexPtr(CurrentLibBase()) << "\n\n";
+
+    if (idapyF) {
+        idapyF << "# Universal Android Unreal Engine SDK Dumper — IDA Pro Renaming Script\n";
+        idapyF << "import idaapi\n\n";
+        idapyF << "def rename(offset, name):\n";
+        idapyF << "    addr = idaapi.get_imagebase() + offset\n";
+        idapyF << "    if addr != idaapi.BADADDR:\n";
+        idapyF << "        idaapi.set_name(addr, name, idaapi.SN_FORCE)\n\n";
+        idapyF << "print(\"[sdk] Starting dynamic renaming...\")\n";
+    }
+
+    if (ghidrapyF) {
+        ghidrapyF << "# Universal Android Unreal Engine SDK Dumper — Ghidra Renaming Script\n";
+        ghidrapyF << "# @category UnrealEngine\n\n";
+        ghidrapyF << "def rename(offset, name):\n";
+        ghidrapyF << "    address = currentProgram.getImageBase().add(offset)\n";
+        ghidrapyF << "    try:\n";
+        ghidrapyF << "        createLabel(address, name, True)\n";
+        ghidrapyF << "    except:\n";
+        ghidrapyF << "        pass\n\n";
+        ghidrapyF << "print \"[sdk] Starting dynamic renaming...\"\n";
+    }
+
+    std::unordered_map<uintptr_t, std::string> fieldClassCache;
+
+    struct NativeFuncEntry {
+        std::string fullPath;
+        std::string sanitizedName;
+        uintptr_t   offset;
+        uint32_t    flags;
+    };
+    std::vector<NativeFuncEntry> nativeFuncs;
+
+    for (uintptr_t pkgAddr : order) {
+        auto pit = packages.find(pkgAddr);
+        if (pit == packages.end()) continue;
+        for (auto a : pit->second.functions) {
+            FunctionInfo fn = BuildFunctionInfo(a, byAddr, fieldClassCache);
+            if (fn.nativeFuncPtr != 0) {
+                NativeFuncEntry entry;
+                entry.fullPath = GetFullFunctionName(a);
+                
+                std::string sanName;
+                for (char c : entry.fullPath) {
+                    if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+                        sanName += c;
+                    } else if (c == '.' || c == ':' || c == '/' || c == '\\') {
+                        sanName += '_';
+                    }
+                }
+                entry.sanitizedName = sanName;
+                entry.offset = fn.nativeFuncPtr - Off::Resolved::LibBase;
+                entry.flags = fn.functionFlags;
+                nativeFuncs.push_back(std::move(entry));
+            }
+        }
+    }
+
+    std::sort(nativeFuncs.begin(), nativeFuncs.end(), [](const NativeFuncEntry& a, const NativeFuncEntry& b) {
+        return a.offset < b.offset;
+    });
+
+    for (const auto& entry : nativeFuncs) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "[0x%08llX] ", (unsigned long long)entry.offset);
+        logF << buf << "Function " << entry.fullPath 
+             << " (Flags: 0x" << std::hex << std::uppercase << entry.flags << std::dec << ")\n";
+
+        if (idapyF) {
+            idapyF << "rename(0x" << std::hex << std::uppercase << entry.offset << std::dec 
+                   << ", \"" << entry.sanitizedName << "\")\n";
+        }
+        if (ghidrapyF) {
+            ghidrapyF << "rename(0x" << std::hex << std::uppercase << entry.offset << std::dec 
+                   << ", \"" << entry.sanitizedName << "\")\n";
+        }
+    }
+
+    if (idapyF) {
+        idapyF << "print(\"[sdk] Renaming complete!\")\n";
+    }
+    if (ghidrapyF) {
+        ghidrapyF << "print \"[sdk] Renaming complete!\"\n";
+    }
+
+    return true;
+}
+
 INTERNAL bool WriteOffsetsLog(const std::string& rootDir) noexcept {
     std::string fname = JoinPath(rootDir, "Offsets.log");
     std::ofstream f(fname);
@@ -4827,9 +5055,20 @@ INTERNAL bool WriteHeaders(const std::vector<uintptr_t>& order,
         SetError("Failed writing Offsets.log");
         return false;
     }
+    if (!WriteNamesDump(rootDir)) {
+        SetError("Failed writing NamesDump.txt");
+        return false;
+    }
+    if (!WriteObjectsDump(rootDir)) {
+        SetError("Failed writing ObjectsDump.txt");
+        return false;
+    }
+    if (!WriteFunctionsLogAndScripts(order, packages, byAddr, rootDir)) {
+        SetError("Failed writing Functions.log / SDKRename scripts");
+        return false;
+    }
     // Write a machine-readable JSON mapping of all classes/structs with their
-    // sizes and member offsets. Useful for external tools, memory editors, and
-    // scripting engines that need offset data without parsing C++ headers.
+    // sizes and member offsets, plus all native functions and their offsets.
     {
         std::string fname = JoinPath(rootDir, "Mappings.json");
         std::ofstream jf(fname);
@@ -4885,6 +5124,27 @@ INTERNAL bool WriteHeaders(const std::vector<uintptr_t>& order,
                        << "\"size\": " << sit->second->propertiesSize
                        << ", \"package\": \"" << pit->second.name << "\""
                        << "}";
+                }
+            }
+            jf << "\n  },\n";
+            jf << "  \"functions\": {\n";
+            bool firstFunc = true;
+            for (uintptr_t pkgAddr : order) {
+                auto pit = packages.find(pkgAddr);
+                if (pit == packages.end()) continue;
+                for (auto a : pit->second.functions) {
+                    FunctionInfo fn = BuildFunctionInfo(a, byAddr, fieldClassCache);
+                    if (fn.nativeFuncPtr != 0) {
+                        if (!firstFunc) jf << ",\n";
+                        firstFunc = false;
+                        std::string fullPath = GetFullFunctionName(a);
+                        uintptr_t offset = fn.nativeFuncPtr - Off::Resolved::LibBase;
+                        jf << "    \"" << fullPath << "\": {"
+                           << "\"offset\": \"0x" << std::hex << std::uppercase << offset << std::dec << "\""
+                           << ", \"flags\": \"0x" << std::hex << std::uppercase << fn.functionFlags << std::dec << "\""
+                           << ", \"package\": \"" << pit->second.name << "\""
+                           << "}";
+                    }
                 }
             }
             jf << "\n  }\n";

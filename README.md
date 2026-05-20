@@ -33,6 +33,23 @@ Once the dump process is successfully initialized and executed via the built-in 
 
 ---
 
+## 📦 Reconstructed Assets & Developer Tooling
+
+Every successful dump run generates more than just standard C++ header files. The dumper produces a full suite of highly optimized analysis and static renaming assets designed to accelerate your reverse-engineering workflow:
+
+| Asset File | Format | Description & Usage Heuristics |
+| :--- | :--- | :--- |
+| **`SDK.hpp`** | C++ Header | The master umbrella include file. Including this single header imports all reconstructed structures, enums, classes, and parameter layouts. |
+| **`NamesDump.txt`** | Plain Text | A flat, ordered catalog of all strings loaded in the global `FNamePool` (`GNames`). Invaluable for finding custom assets, mapping namespaces, or simple `Ctrl+F` string reference searching. |
+| **`ObjectsDump.txt`** | Plain Text | A live memory index of *every active GObject instance* loaded in the `GUObjectArray` at the second of the dump. Includes instance memory addresses, internal indices, and OuterPrivate-resolved object hierarchy paths. |
+| **`Offsets.log`** | Plain Text | Human-readable log detailing the dynamically resolved addresses of core reflection roots (`GUObjectArray`, `FNamePool`, `GWorld`, `ProcessEvent`) and engine internal offsets. |
+| **`Functions.log`** | Plain Text | A consolidated registry of all native functions resolved during the dump. Functions are sorted sequentially by their absolute virtual offsets (`nativeFuncPtr - LibBase`) to easily trace executable code neighborhoods. |
+| **`Mappings.json`** | JSON | Machine-readable, standardized dictionary mapping all classes, structs, member offsets, and native functions. Perfect for scripting, automation, or custom overlay-menu generators. |
+| **`SDKRename_IDA.py`** | Python | A ready-to-run IDA Pro script that automatically remaps stripped, offset-based functions (e.g. `sub_F83C10`) inside `libUE4.so` or `libUnreal.so` to their original, fully qualified Unreal Engine names. |
+| **`SDKRename_Ghidra.py`** | Python | An equivalent Ghidra label creation script to instantly rename stripping-affected subroutines inside the Ghidra decompiler database. |
+
+---
+
 ## 🛠️ Compilation & Build Methods
 
 The project Gradle configuration exposes **two distinct methods** of compiling the application to optimize developer iteration speeds:
