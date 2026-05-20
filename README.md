@@ -84,15 +84,31 @@ To find `GUObjectArray` (the global array containing all active reflection objec
 | :--- | :--- | :--- |
 | **Symbol** | Static & Dynamic Symbol Lookup | Tries resolving known mangled and unmangled symbol names (`GUObjectArray`, `_Z13GUObjectArray`, `_ZN12FUObjectArray13GUObjectArrayE`, `ObjectsArray`) using `FindSymbolDynamic` (for dynamic symbol tables) and `FindSymbolDisk` (reading the raw ELF from the APK file). Candidates are instantly checked via structural layout probing. |
 | **String-Ref** | Literal materialization trace | 1. Scans `.rodata` for known string constants (e.g., `"GUObjectArray"`, `"FUObjectArray"`, `"MaxObjectsNotConsideredByGC"`, `"UObjectBase::IsValidLowLevelFast"`).<br>2. Scans `.text` segments for AArch64 instructions that materialize these literals (`ADRP+ADD` or `ADRP+LDR` pairs).<br>3. From the reference site, walks local instructions to trace registers resolving to writable segments (`.data` / `.bss`).<br>4. Structural validation is called on those targets. |
+| **Code-Ref Quick** | Fast Instruction Scan | Performs a quick AArch64 instruction scan over high-probability function neighborhoods to locate `ADRP+ADD` or `ADRP+LDR` materializations near common entry points, speeding up detection on standard builds. |
 | **Code-Ref** | Exhaustive Instruction Scan | Walks the entire executable `.text` segment instruction-by-instruction. It decodes all AArch64 `ADRP+ADD`/`ADRP+LDR` pairs, tracks dynamic register materializations, and whenever a writeable-segment address target is encountered, validates it with a layout probe. This is extremely robust and **engine-agnostic** since it does not depend on literals surviving compilation. |
+| **Pattern** | Byte Signature Match | Scans executable segments for custom or known byte signature patterns to locate the target `GUObjectArray` reference directly. |
 | **BSS Scan** | Structural Brute Scan | A fast, exhaustive walk of `libUE4.so`'s writable segments (`.data` and `.bss` PT_LOAD segments) at 8-byte strides. It runs layout validations on every address. Because validation is highly strict, non-UObject targets fail in 1-2 memory reads, making it cheap and safe. |
 | **DeepScan** | Cross-Library BSS Scan | Performs a structural BSS scan across **all loaded shared libraries** on the Android device. This is crucial for modern UE5 games where engine modules are split, and `GUObjectArray` may reside in a sibling library (like `libCoreUObject.so` instead of `libUnreal.so`). |
 
-#### 🛡️ GUObjectArray Validation (`Probe`)
-Every candidate address found by the scanner is run through strict layout validations (`ObjectArray::Probe`). A candidate is only accepted if:
-* The chunk layout is perfectly aligned and within bounds.
-* The items at index `0` and `1` have an internal index matching their array position.
-* The first object's virtual function table (`vtable`) points to an executable memory segment in loaded modules.
+#### 🛡️ GUObjectArray Auto-Detection & Validation (`Probe`)
+Every candidate address found by the scanner is run through an advanced, multi-layered layout auto-detection and validation pass (`ObjectArray::Probe`). A candidate is only accepted and initialized if it passes the following structural validation criteria:
+
+1. **Outer Wrapper vs. Inner Address Auto-Detection:**
+   The dumper automatically detects if the provided address points to the outer `GUObjectArray` (with the inner `TUObjectArray` at `+0x10` offset) or directly to the inner `TUObjectArray` member.
+2. **Chunked vs. Flat Layout Detection:**
+   It auto-detects if the array is **Chunked (`FChunkedFixedUObjectArray`)** or **Flat (`FFixedUObjectArray`)** by validating count heuristics:
+   * **Chunked:** Validates `NumElements`, `MaxElements`, `NumChunks`, `MaxChunks`, and the `Objects` chunk array pointer.
+   * **Flat:** Validates `NumElements`, `MaxElements`, and the flat `Objects` array pointer.
+   * **Heuristics:** Enforces that `NumElements` is sane ($1,024 \le N \le 100,000,000$) and `MaxElements \ge NumElements`.
+3. **`FUObjectItem` Stride Size Auto-Detection:**
+   The dumper automatically determines the stride size of `FUObjectItem` structures (either `0x18` for older UE4.13–UE4.21 versions, or `0x20` for UE4.22+ and UE5). It does this by testing both stride hypotheses on the first few entries and checking if the resolved `Object` pointers point to valid `UObject` instances.
+4. **`UObject` Layout Invariant Checking:**
+   For a candidate layout, it performs strict structural dereference checks on the first 512 objects:
+   * The `Object` pointer is decoded (with optional decryption applied).
+   * The object's `InternalIndex` (found at `UObject + 0x0C`) must exactly match its array position index.
+   * The object's `vtable` pointer (found at `UObject + 0x00`) must point to a readable, executable memory segment in the game's loaded modules (specifically within `libUE4` / `libUnreal` or mapped segments).
+5. **Pointer Decryption Callback:**
+   Supports games that encrypt or XOR-mask stored `UObject` pointers in the object array via `ObjectArray::SetDecryption` (passing a custom decryption lambda).
 
 ---
 
@@ -102,11 +118,19 @@ To find `FNamePool` (which stores the strings representing Unreal Engine object 
 
 | Strategy | Search Type | Detailed Logic & Operations |
 | :--- | :--- | :--- |
-| **Symbol** | Dynamic Symbol Lookup | Tries resolving known symbol patterns (like `GNames`, `FNamePool`, etc.) from dynsym or disk symbol tables, running validations on each candidate. |
+| **Symbol** | Dynamic Symbol Lookup | Tries resolving known symbol patterns (like `GNames`, `FNamePool`, etc.) from dynsym or disk symbol tables, running validations on each candidate. Includes fuzzy substring scan over `.dynsym` table for symbols containing "NamePool", "GNameBlocks", or "GNames". |
 | **Func-Walk** | Control Flow Disassembly | 1. Resolves high-probability FName constructor/conversion symbol anchors from the dynamic/disk tables (e.g., `FName::ToString`, `FName::AppendString`, and constructors like `_ZN5FNameC1EPKc9EFindName`).<br>2. Disassembles a window of instructions (`kFuncWalkBytes`) in the target functions.<br>3. Dynamically decodes `ADRP+ADD` instructions and follows branches (`B`/`BL`) one hop deep to trace and extract candidate `FNamePool` materialization addresses inside secondary child functions (e.g., `FNamePool::Find`). |
 | **String-Ref** | Literal materialization trace | Scans `.rodata` for strings embedded in FName functions (such as `"Failed to find name '%s'"`, `"Name table corrupted"`, `"Reserve %d entries"`, or `"NamePoolData"`). It traces their code materialization references in `.text` to isolate nearby `FNamePool` global variables. |
+| **Code-Ref Quick** | Fast Instruction Scan | A fast instruction scan over high-probability function neighborhoods to identify `ADRP+ADD` or `ADRP+LDR` materializations, speeding up detection. |
 | **Code-Ref** | Exhaustive Instruction Scan | Instruction-by-instruction scan of the executable memory space to identify `ADRP+ADD` or `ADRP+LDR` instructions resolving to writeable data segments, running name validation checks on each target. |
+| **Pattern** | Byte Signature Match | Scans executable segments for custom or known byte signature patterns. |
 | **BSS Scan** | Structural Brute Scan | Walks `.data` and `.bss` segments at 8-byte strides and runs strict verification checks. |
 
-#### 🛡️ GNames Validation (`Probe`)
-`FNamePool` candidates are validated dynamically by checking for a valid `"None"` entry at structural `Blocks[0]`, ensuring that character boundaries and length headers perfectly align with the standard name-entry structure.
+#### 🛡️ GNames Validation (`Probe`) & Layout Detection
+`FNamePool` candidates are validated dynamically by checking for a valid `"None"` entry at structural `Blocks[0]`, ensuring that character boundaries and length headers perfectly align with the standard name-entry structure. 
+
+The dumper automatically detects:
+* **FNamePool vs. Legacy String Tables:** Supports both modern `FNamePool` (UE4.23+) and older legacy `TNameEntryArray` structures.
+* **`Blocks` Offset Detection:** Inside `FNamePool`, it auto-detects the offset of the inner `Blocks[]` pointer array by probing candidate offsets and verifying that index `0` resolves and decodes to `"None"`.
+* **Case-Preserving Support:** Supports case-preserving strings (`bIsCasePreserving`).
+* **`AppendString` Support:** Detects and resolves `FName::AppendString` function address for direct execution.
