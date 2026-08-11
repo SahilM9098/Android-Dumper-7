@@ -20,9 +20,12 @@
 #include "NameArray.h"
 
 #include <android/log.h>
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 
 #define DUMPER_LOG_TAG "Dumper7"
 #define DLOGI(fmt, ...) __android_log_print(ANDROID_LOG_INFO,  DUMPER_LOG_TAG, fmt, ##__VA_ARGS__)
@@ -38,9 +41,10 @@ struct State {
     uintptr_t source         = 0;     // address as supplied to Init
     uintptr_t blocksArray    = 0;     // resolved Blocks[] base
     int32_t   blocksOffset   = 0;     // blocksArray - source, when direct
-    bool      doubleIndirect = false; // true when source is a pointer-to-Blocks
-                                      // (e.g. UE5 GNameBlocksDebug)
+    bool      doubleIndirect = false; // true when source is an indirection slot
+                                      // (modern GNameBlocksDebug or legacy GNames*)
     bool      casePreserving = false; // FNameEntryHeader layout — see decoders
+    bool      legacy         = false; // TNameEntryArray (UE4.22 and earlier)
     int32_t   lengthShift    = 6;     // bits to shift header right to get length
                                       // standard=6, case-preserving=1, auto-detected
     int32_t   stringOffset   = 2;     // byte offset from entry start to string data
@@ -49,6 +53,21 @@ struct State {
 INTERNAL State& S() noexcept {
     static State s;
     return s;
+}
+
+INTERNAL std::unordered_map<int32_t, std::string>& NameCache() noexcept {
+    static std::unordered_map<int32_t, std::string> cache;
+    return cache;
+}
+
+INTERNAL std::mutex& NameCacheMutex() noexcept {
+    static std::mutex mutex;
+    return mutex;
+}
+
+INTERNAL void ClearNameCache() noexcept {
+    std::lock_guard<std::mutex> lk(NameCacheMutex());
+    NameCache().clear();
 }
 
 // "None" is the canonical FName at index 0. Length 4, narrow.
@@ -197,6 +216,63 @@ INTERNAL bool ReadEntryAtAddress(uintptr_t entryAddr, std::string& outName) noex
     return ReadEntryWithLayout(entryAddr, S().casePreserving, outName);
 }
 
+// Older UE4 branches store FNameEntry objects behind an indirect pointer
+// table.  Unlike FNamePool, an entry is not length-prefixed: bit 0 at +0 is
+// the wide flag and the null-terminated name starts at +0x10.
+INTERNAL bool ReadLegacyWideEntry(uintptr_t entryAddr, int32_t stride,
+                                  std::string& outName) noexcept {
+    outName.clear();
+    constexpr int32_t kMaxLegacyNameChars = 1023;
+    for (int32_t i = 0; i < kMaxLegacyNameChars; ++i) {
+        uint32_t code = 0;
+        if (stride == 4) {
+            auto unit = SafeMemory::SafeReadAny<uint32_t>(
+                    entryAddr + Off::FNameEntry::LegacyName + static_cast<uintptr_t>(i) * 4);
+            if (!unit) return false;
+            code = *unit;
+        } else {
+            auto unit = SafeMemory::SafeReadAny<uint16_t>(
+                    entryAddr + Off::FNameEntry::LegacyName + static_cast<uintptr_t>(i) * 2);
+            if (!unit) return false;
+            code = *unit;
+        }
+        if (code == 0) return !outName.empty();
+        outName.push_back(code < 0x80 ? static_cast<char>(code) : '?');
+    }
+    outName.clear();
+    return false;
+}
+
+INTERNAL bool ReadLegacyEntry(uintptr_t entryAddr, std::string& outName) noexcept {
+    outName.clear();
+    if (entryAddr < 0x10000) return false;
+
+    auto flags = SafeMemory::SafeReadAny<uint8_t>(entryAddr);
+    if (!flags) return false;
+
+    if ((*flags & 0x1) != 0) {
+        // Android's legacy UE4 FNameEntry uses 32-bit wchar_t.  Keep the
+        // UTF-16 fallback for older vendor forks which used 16-bit storage.
+        std::string wide4;
+        if (ReadLegacyWideEntry(entryAddr, 4, wide4) && WideDecodeScore(wide4) >= 1) {
+            outName = std::move(wide4);
+            return true;
+        }
+        return ReadLegacyWideEntry(entryAddr, 2, outName);
+    }
+
+    constexpr int32_t kMaxLegacyNameChars = 1023;
+    for (int32_t i = 0; i < kMaxLegacyNameChars; ++i) {
+        auto c = SafeMemory::SafeReadAny<uint8_t>(
+                entryAddr + Off::FNameEntry::LegacyName + i);
+        if (!c) { outName.clear(); return false; }
+        if (*c == 0) return !outName.empty();
+        outName.push_back(static_cast<char>(*c));
+    }
+    outName.clear();
+    return false;
+}
+
 // Validate that `blocksAt` resolves to a Blocks[] array whose first block's
 // first entry decodes to "None". `casePreservingOut` reports which header
 // layout produced the match.
@@ -230,6 +306,7 @@ struct DetectResult {
     int32_t   blocksOffset   = 0;
     bool      doubleIndirect = false;
     bool      casePreserving = false;
+    bool      legacy         = false;
 };
 
 // Try to resolve an actual Blocks[] base from `poolAddr` under three
@@ -289,6 +366,70 @@ INTERNAL DetectResult DetectBlocks(uintptr_t poolAddr) noexcept {
     return r;
 }
 
+// Validate the layout used before FNamePool was introduced:
+//
+//   TNameEntryArray {
+//       FNameEntry** Chunks[128];  // 0x000
+//       int32 NumElements;         // 0x400
+//       int32 NumChunks;           // 0x404
+//   };
+//
+// `source` can be the table itself or the common GNames global pointer whose
+// value is the table.  Requiring both the documented element count and entry
+// zero to decode to "None" makes this safe to use during broad BSS scans.
+INTERNAL bool ValidateLegacyTable(uintptr_t tableAddr) noexcept {
+    if (tableAddr < 0x10000) return false;
+
+    auto numElements = SafeMemory::SafeReadAny<int32_t>(
+            tableAddr + Off::TNameEntryArray::NumElementsOffset);
+    if (!numElements || *numElements < 1 ||
+        static_cast<uint32_t>(*numElements) > Off::TNameEntryArray::MaxElements) {
+        return false;
+    }
+
+    auto chunk0 = SafeMemory::SafeReadAny<uintptr_t>(
+            tableAddr + Off::TNameEntryArray::ChunksOffset);
+    if (!chunk0 || *chunk0 < 0x10000) return false;
+
+    auto entry0 = SafeMemory::SafeReadAny<uintptr_t>(*chunk0);
+    if (!entry0 || *entry0 < 0x10000) return false;
+
+    std::string firstName;
+    return ReadLegacyEntry(*entry0, firstName) && firstName == kSentinelName;
+}
+
+INTERNAL DetectResult DetectLegacyArray(uintptr_t sourceAddr) noexcept {
+    DetectResult r;
+
+    if (ValidateLegacyTable(sourceAddr)) {
+        r.ok = true;
+        r.blocksArray = sourceAddr;
+        r.blocksOffset = 0;
+        r.doubleIndirect = false;
+        r.legacy = true;
+        return r;
+    }
+
+    auto table = SafeMemory::SafeReadAny<uintptr_t>(sourceAddr);
+    if (table && ValidateLegacyTable(*table)) {
+        r.ok = true;
+        r.blocksArray = *table;
+        r.blocksOffset = 0;
+        r.doubleIndirect = true;
+        r.legacy = true;
+    }
+    return r;
+}
+
+INTERNAL DetectResult DetectNameStorage(uintptr_t sourceAddr) noexcept {
+    // Check legacy first.  A TNameEntryArray starts with pointers, so treating
+    // it as a modern FNamePool can make the latter's broad offset probe chase
+    // arbitrary pointer-shaped words before the legacy validator gets a turn.
+    DetectResult r = DetectLegacyArray(sourceAddr);
+    if (!r.ok) r = DetectBlocks(sourceAddr);
+    return r;
+}
+
 }  // namespace
 
 // =========================================================================
@@ -299,6 +440,7 @@ bool NameArray::Init(uintptr_t addr) noexcept {
     State& s = S();
     s.initialized = false;
     s.source      = addr;
+    ClearNameCache();
 
     if (addr == 0) {
         DLOGE("NameArray::Init: null address");
@@ -307,7 +449,7 @@ bool NameArray::Init(uintptr_t addr) noexcept {
 
     SafeMemory::ScopedSigSegvGuard guard;
     DetectResult d{};
-    guard.Try([&] { d = DetectBlocks(addr); });
+    guard.Try([&] { d = DetectNameStorage(addr); });
 
     if (!d.ok) {
         DLOGE("NameArray::Init: detection failed at 0x%lx", (unsigned long)addr);
@@ -318,13 +460,21 @@ bool NameArray::Init(uintptr_t addr) noexcept {
     s.blocksArray     = d.blocksArray;
     s.doubleIndirect  = d.doubleIndirect;
     s.casePreserving  = d.casePreserving;
+    s.legacy          = d.legacy;
     s.lengthShift     = d.casePreserving ? 1 : 6;  // default; auto-detect may override
     s.stringOffset    = 2;                          // default; auto-detect may override
     s.initialized     = true;
     Off::FNamePool::BlocksOffset = d.blocksOffset;
     Off::Resolved::GNames = addr;
-    Off::InSDK::bIsCasePreserving = d.casePreserving;
-    Off::InSDK::bUsesNamePool = true;
+    Off::InSDK::bIsCasePreserving = !d.legacy && d.casePreserving;
+    Off::InSDK::bUsesNamePool = !d.legacy;
+
+    if (d.legacy) {
+        DLOGI("NameArray::Init: source=0x%lx -> TNameEntryArray=0x%lx (%s)",
+              (unsigned long)addr, (unsigned long)d.blocksArray,
+              d.doubleIndirect ? "via *source" : "direct");
+        return true;
+    }
 
     // --- Auto-detect FNameEntry header shift count ---
     // Dumper-7 approach: find the "ByteProperty" entry (second entry in block 0
@@ -420,6 +570,7 @@ bool NameArray::Init(uintptr_t addr) noexcept {
 
 void NameArray::Reset() noexcept {
     S() = State{};
+    ClearNameCache();
 }
 
 bool      NameArray::IsInitialized()      noexcept { return S().initialized; }
@@ -428,18 +579,19 @@ uintptr_t NameArray::SourceAddress()      noexcept { return S().source; }
 uintptr_t NameArray::BlocksArrayAddress() noexcept { return S().blocksArray; }
 bool      NameArray::IsDoubleIndirect()   noexcept { return S().doubleIndirect; }
 bool      NameArray::IsCasePreserving()   noexcept { return S().casePreserving; }
+bool      NameArray::IsLegacy()            noexcept { return S().legacy; }
 
 bool NameArray::Probe(uintptr_t addr) noexcept {
     if (addr == 0) return false;
     SafeMemory::ScopedSigSegvGuard guard;
     bool ok = false;
-    guard.Try([&] { ok = DetectBlocks(addr).ok; });
+    guard.Try([&] { ok = DetectNameStorage(addr).ok; });
     return ok;
 }
 
 bool NameArray::ProbeNoGuard(uintptr_t addr) noexcept {
     if (addr == 0) return false;
-    return DetectBlocks(addr).ok;
+    return DetectNameStorage(addr).ok;
 }
 
 bool NameArray::ProbeReport(uintptr_t addr, std::vector<std::string>& report) noexcept {
@@ -539,7 +691,16 @@ bool NameArray::ProbeReport(uintptr_t addr, std::vector<std::string>& report) no
         return true;
     }
 
-    add("rejected: neither direct nor indirect interpretation produced \"None\"");
+    DetectResult legacy{};
+    guard.Try([&] { legacy = DetectLegacyArray(addr); });
+    if (legacy.ok) {
+        add("validated (legacy): TNameEntryArray=0x%lx %s; entry[0] == \"None\"",
+            (unsigned long)legacy.blocksArray,
+            legacy.doubleIndirect ? "via *source" : "direct");
+        return true;
+    }
+
+    add("rejected: neither FNamePool nor legacy TNameEntryArray produced \"None\"");
     return false;
 }
 
@@ -551,6 +712,35 @@ NameArray::WalkBlock(int32_t blockIndex, int32_t maxCount) noexcept {
 
     SafeMemory::ScopedSigSegvGuard guard;
     guard.Try([&] {
+        if (s.legacy) {
+            if (blockIndex >= 128) return;
+            auto total = SafeMemory::SafeReadAny<int32_t>(
+                    s.blocksArray + Off::TNameEntryArray::NumElementsOffset);
+            if (!total || *total <= 0) return;
+
+            const int32_t firstIndex = blockIndex << Off::TNameEntryArray::ChunkOffsetBits;
+            if (firstIndex >= *total) return;
+            const int32_t available = std::min<int32_t>(
+                    static_cast<int32_t>(Off::TNameEntryArray::ChunkOffsetMask) + 1,
+                    *total - firstIndex);
+            auto chunk = SafeMemory::SafeReadAny<uintptr_t>(
+                    s.blocksArray + Off::TNameEntryArray::ChunksOffset +
+                    static_cast<uintptr_t>(blockIndex) * sizeof(uintptr_t));
+            if (!chunk || *chunk == 0) return;
+
+            const int32_t count = std::min<int32_t>(available, maxCount);
+            for (int32_t i = 0; i < count; ++i) {
+                auto entry = SafeMemory::SafeReadAny<uintptr_t>(
+                        *chunk + static_cast<uintptr_t>(i) * sizeof(uintptr_t));
+                if (!entry || *entry == 0) continue;
+                std::string name;
+                if (ReadLegacyEntry(*entry, name)) {
+                    out.emplace_back(firstIndex + i, std::move(name));
+                }
+            }
+            return;
+        }
+
         auto blockPtr = SafeMemory::SafeReadAny<uintptr_t>(
                 s.blocksArray + blockIndex * sizeof(uintptr_t));
         if (!blockPtr || *blockPtr == 0) return;
@@ -603,12 +793,10 @@ std::string NameArray::GetName(int32_t comparisonIndex) noexcept {
     // <200K unique FName indices, but the same indices (e.g. "IntProperty",
     // "Class", "None") are resolved thousands of times. Caching here
     // eliminates redundant FNamePool block walks and SafeMemory guard setup.
-    static std::unordered_map<int32_t, std::string> nameCache;
-    static std::mutex nameCacheMu;
     {
-        std::lock_guard<std::mutex> lk(nameCacheMu);
-        auto it = nameCache.find(comparisonIndex);
-        if (it != nameCache.end()) return it->second;
+        std::lock_guard<std::mutex> lk(NameCacheMutex());
+        auto it = NameCache().find(comparisonIndex);
+        if (it != NameCache().end()) return it->second;
     }
 
     const uint32_t blockIndex   = static_cast<uint32_t>(comparisonIndex)
@@ -619,6 +807,27 @@ std::string NameArray::GetName(int32_t comparisonIndex) noexcept {
     SafeMemory::ScopedSigSegvGuard guard;
     std::string out;
     guard.Try([&] {
+        if (s.legacy) {
+            auto total = SafeMemory::SafeReadAny<int32_t>(
+                    s.blocksArray + Off::TNameEntryArray::NumElementsOffset);
+            if (!total || comparisonIndex >= *total) return;
+
+            const uint32_t blockIndex = static_cast<uint32_t>(comparisonIndex)
+                    >> Off::TNameEntryArray::ChunkOffsetBits;
+            const uint32_t entryOffset = static_cast<uint32_t>(comparisonIndex)
+                    & Off::TNameEntryArray::ChunkOffsetMask;
+            if (blockIndex >= 128) return;
+            auto chunk = SafeMemory::SafeReadAny<uintptr_t>(
+                    s.blocksArray + Off::TNameEntryArray::ChunksOffset +
+                    static_cast<uintptr_t>(blockIndex) * sizeof(uintptr_t));
+            if (!chunk || *chunk == 0) return;
+            auto entry = SafeMemory::SafeReadAny<uintptr_t>(
+                    *chunk + static_cast<uintptr_t>(entryOffset) * sizeof(uintptr_t));
+            if (!entry || *entry == 0) return;
+            ReadLegacyEntry(*entry, out);
+            return;
+        }
+
         auto blockPtr = SafeMemory::SafeReadAny<uintptr_t>(
                 s.blocksArray + blockIndex * sizeof(uintptr_t));
         if (!blockPtr || *blockPtr == 0) return;
@@ -629,8 +838,8 @@ std::string NameArray::GetName(int32_t comparisonIndex) noexcept {
 
     // Cache the result (even empty strings — avoids re-trying bad indices)
     if (!out.empty()) {
-        std::lock_guard<std::mutex> lk(nameCacheMu);
-        nameCache.emplace(comparisonIndex, out);
+        std::lock_guard<std::mutex> lk(NameCacheMutex());
+        NameCache().emplace(comparisonIndex, out);
     }
     return out;
 }

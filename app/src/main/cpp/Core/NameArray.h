@@ -1,14 +1,14 @@
 // =============================================================================
 // Core/NameArray.h
 // -----------------------------------------------------------------------------
-// Singleton wrapper around UE4's name pool. Targets FNamePool (UE4.23+).
-// TNameEntryArray (older) support is structurally similar but not yet wired.
+// Singleton wrapper around UE4's global name storage. Supports both the
+// FNamePool used by UE4.23+ and the older TNameEntryArray used by UE4.22 and
+// earlier (including the original ARK Mobile build).
 //
-// Init(addr) takes the address of NamePoolData (a.k.a. FNamePool::NamePoolData,
-// the global instance) and auto-detects the offset of the inner Blocks[]
-// pointer array. Detection works by probing candidate offsets and validating
-// that the resulting first entry decodes to "None" (FName index 0 is
-// reserved for "None" in every UE build).
+// Init(addr) takes either the global storage address or a global pointer slot.
+// It identifies FNamePool by probing its Blocks[] pointer array, or validates
+// a legacy TNameEntryArray by resolving entry zero.  Both layouts must decode
+// FName index 0 to "None".
 //
 // GetName(index) decomposes ComparisonIndex into (block, offset_in_block),
 // dereferences the appropriate Blocks slot, and decodes the FNameEntryHeader
@@ -63,6 +63,7 @@ public:
     INTERNAL static uintptr_t   BlocksArrayAddress() noexcept;
     INTERNAL static bool        IsDoubleIndirect() noexcept;
     INTERNAL static bool        IsCasePreserving() noexcept;
+    INTERNAL static bool        IsLegacy() noexcept;
 };
 
 }  // namespace UE

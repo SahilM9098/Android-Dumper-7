@@ -102,16 +102,41 @@ INTERNAL bool TryReadAnyValue(uintptr_t addr, T& out) noexcept {
     return ok;
 }
 
-// Pattern: candidate offset stores a non-null pointer whose first 8 bytes
-// (the vtable) lie in an executable segment of any loaded module. Mirrors
-// the UObject vtable invariant Probe relies on.
+// For normal UE4/5 builds, a UObject is recognized from its vtable's module
+// segment.  Some older Android UE4 builds put UClass vtables in a mapping the
+// loader does not expose through PT_LOAD/RELRO, so the strict check rejects
+// every otherwise-valid ClassPrivate pointer.  In legacy-name mode only, fall
+// back to a structural scan for a decodable FName in the UObject header.
+INTERNAL bool HasLegacyUObjectName(uintptr_t cand) noexcept {
+    if (!UE::NameArray::IsInitialized()) return false;
+
+    // The legacy UObject header keeps its FName after flags/index/class.  Do
+    // not assume one exact offset: test the small header window so vendor
+    // forks with a shifted class pointer remain supported.
+    for (int32_t off = 0x10; off <= 0x28; off += 4) {
+        int32_t comparisonIndex = 0;
+        int32_t number = 0;
+        if (!TryReadAnyValue<int32_t>(cand + off, comparisonIndex) ||
+            !TryReadAnyValue<int32_t>(cand + off + 4, number)) {
+            continue;
+        }
+        if (comparisonIndex < 0 || comparisonIndex > 0x40000000 ||
+            number < 0 || number > 0x10000) {
+            continue;
+        }
+        if (!UE::NameArray::GetName(comparisonIndex).empty()) return true;
+    }
+    return false;
+}
+
 INTERNAL bool LooksLikeUObjectPointer(uintptr_t cand) noexcept {
     if (cand == 0) return false;
     if ((cand & 0x7) != 0) return false;            // 8-byte alignment
     uintptr_t vt = 0;
     if (!TryReadAnyValue<uintptr_t>(cand, vt) || vt == 0) return false;
     if ((vt & 0x7) != 0) return false;
-    return SafeMemory::IsExecutable(vt);
+    if (SafeMemory::IsExecutable(vt)) return true;
+    return !Off::InSDK::bUsesNamePool && HasLegacyUObjectName(cand);
 }
 
 // Pattern: candidate offset stores 8-byte FName whose ComparisonIndex

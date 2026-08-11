@@ -295,16 +295,25 @@ void RenderContent() noexcept {
     if (UE::NameArray::IsInitialized()) {
         ImGui::Separator();
         ImGui::Text("source @     : 0x%016lx", (unsigned long)UE::NameArray::SourceAddress());
-        ImGui::Text("blocksArray @: 0x%016lx", (unsigned long)UE::NameArray::BlocksArrayAddress());
-        ImGui::Text("BlocksOffset : 0x%x",     UE::NameArray::BlocksOffset());
-        ImGui::Text("indirection  : %s",
-                    UE::NameArray::IsDoubleIndirect()
-                        ? "double (*source -> &Blocks)"
-                        : "direct (source + BlocksOffset)");
-        ImGui::Text("hdr layout   : %s",
-                    UE::NameArray::IsCasePreserving()
-                        ? "case-preserving (15-bit Len)"
-                        : "standard (10-bit Len + 5-bit hash)");
+        if (UE::NameArray::IsLegacy()) {
+            ImGui::Text("name table @: 0x%016lx", (unsigned long)UE::NameArray::BlocksArrayAddress());
+            ImGui::Text("layout       : legacy TNameEntryArray (UE4.22 and earlier)");
+            ImGui::Text("indirection  : %s",
+                        UE::NameArray::IsDoubleIndirect()
+                            ? "*source -> TNameEntryArray"
+                            : "source is TNameEntryArray");
+        } else {
+            ImGui::Text("blocksArray @: 0x%016lx", (unsigned long)UE::NameArray::BlocksArrayAddress());
+            ImGui::Text("BlocksOffset : 0x%x",     UE::NameArray::BlocksOffset());
+            ImGui::Text("indirection  : %s",
+                        UE::NameArray::IsDoubleIndirect()
+                            ? "double (*source -> &Blocks)"
+                            : "direct (source + BlocksOffset)");
+            ImGui::Text("hdr layout   : %s",
+                        UE::NameArray::IsCasePreserving()
+                            ? "case-preserving (15-bit Len)"
+                            : "standard (10-bit Len + 5-bit hash)");
+        }
 
         ImGui::Separator();
         ImGui::TextDisabled("Lookup by ComparisonIndex:");

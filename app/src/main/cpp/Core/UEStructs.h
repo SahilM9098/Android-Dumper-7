@@ -225,6 +225,18 @@ namespace FNameEntry {
     inline int32_t LegacyEntrySize = 0x60;  // worst-case
 }
 
+// Pre-4.23 global-name table.  TNameEntryArray is an indirect array of
+// FNameEntry pointers: 128 chunks of 16,384 entries, followed by NumElements.
+// The offsets below are the Android/64-bit layout used by the older UE4 branch
+// (including the original ARK Mobile release).
+namespace TNameEntryArray {
+    inline int32_t ChunksOffset       = 0x000;
+    inline int32_t NumElementsOffset  = 0x400;
+    inline uint32_t ChunkOffsetBits   = 14;
+    inline uint32_t ChunkOffsetMask   = 0x3FFF;
+    inline uint32_t MaxElements       = 2 * 1024 * 1024;
+}
+
 namespace FNamePool {
     // FNamePool layout (UE4.23+). Auto-detected at runtime by NameArray::Init
     // because the offset of the inner Blocks[] array drifts per engine version

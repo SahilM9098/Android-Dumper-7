@@ -2964,6 +2964,18 @@ INTERNAL bool WriteBasicHpp(const std::string& outDir) noexcept {
       << (Off::InSDK::bIsCasePreserving ? "true" : "false") << ";\n";
     f << "    static constexpr bool GNamesIsDoubleIndirect = "
       << (UE::NameArray::IsDoubleIndirect() ? "true" : "false") << ";\n";
+    f << "    static constexpr bool GNamesUsesNamePool = "
+      << (Off::InSDK::bUsesNamePool ? "true" : "false") << ";\n";
+    f << "    static constexpr int32 LegacyNameChunksOffset = "
+      << Off::TNameEntryArray::ChunksOffset << ";\n";
+    f << "    static constexpr int32 LegacyNameNumElementsOffset = "
+      << Off::TNameEntryArray::NumElementsOffset << ";\n";
+    f << "    static constexpr uint32 LegacyNameChunkOffsetBits = "
+      << Off::TNameEntryArray::ChunkOffsetBits << ";\n";
+    f << "    static constexpr uint32 LegacyNameChunkOffsetMask = "
+      << Off::TNameEntryArray::ChunkOffsetMask << ";\n";
+    f << "    static constexpr int32 LegacyNameEntryNameOffset = "
+      << Off::FNameEntry::LegacyName << ";\n";
     f << "    static constexpr int32 UObjectClassPrivate = "
       << Off::UObject::ClassPrivate << ";\n";
     f << "    static constexpr int32 UObjectOuterPrivate = "
@@ -3173,6 +3185,7 @@ INTERNAL bool WriteBasicHpp(const std::string& outDir) noexcept {
     f << "    inline static void*& Names = SDK::GNames;\n";
     f << "    static void Init(void* InGNames) { SDK::GNames = InGNames; }\n";
     f << "    static void** GetBlocksArray() {\n";
+    f << "        if constexpr (!SDKOffsets::GNamesUsesNamePool) return nullptr;\n";
     f << "        if (!SDK::GNames) return nullptr;\n";
     f << "        auto Base = reinterpret_cast<std::uintptr_t>(SDK::GNames);\n";
     f << "        if constexpr (SDKOffsets::GNamesIsDoubleIndirect) {\n";
@@ -3180,6 +3193,19 @@ INTERNAL bool WriteBasicHpp(const std::string& outDir) noexcept {
     f << "        } else {\n";
     f << "            return reinterpret_cast<void**>(Base + SDKOffsets::FNamePoolBlocksOffset);\n";
     f << "        }\n";
+    f << "    }\n";
+    f << "    static std::uintptr_t GetLegacyTable() {\n";
+    f << "        if constexpr (SDKOffsets::GNamesUsesNamePool) return 0;\n";
+    f << "        auto Base = reinterpret_cast<std::uintptr_t>(SDK::GNames);\n";
+    f << "        if (!Base) return 0;\n";
+    f << "        if constexpr (SDKOffsets::GNamesIsDoubleIndirect) {\n";
+    f << "            return *reinterpret_cast<std::uintptr_t*>(Base);\n";
+    f << "        }\n";
+    f << "        return Base;\n";
+    f << "    }\n";
+    f << "    static void** GetLegacyChunks() {\n";
+    f << "        const std::uintptr_t Table = GetLegacyTable();\n";
+    f << "        return Table ? reinterpret_cast<void**>(Table + SDKOffsets::LegacyNameChunksOffset) : nullptr;\n";
     f << "    }\n";
     f << "    static std::string DecodeEntry(std::uintptr_t Entry) {\n";
     f << "        if (!Entry) return {};\n";
@@ -3200,6 +3226,27 @@ INTERNAL bool WriteBasicHpp(const std::string& outDir) noexcept {
     f << "        if (WideDecodeScore(Wide2) >= Len) return Wide2;\n";
     f << "        std::string Wide4 = DecodeWideEntry(Entry, Len, 4);\n";
     f << "        return WideDecodeScore(Wide4) > WideDecodeScore(Wide2) ? Wide4 : Wide2;\n";
+    f << "    }\n";
+    f << "    static std::string DecodeLegacyEntry(std::uintptr_t Entry) {\n";
+    f << "        if (!Entry) return {};\n";
+    f << "        const bool bWide = (*reinterpret_cast<const uint8*>(Entry) & 0x1) != 0;\n";
+    f << "        constexpr int32 MaxLen = 1023;\n";
+    f << "        std::string Out;\n";
+    f << "        if (!bWide) {\n";
+    f << "            const char* Str = reinterpret_cast<const char*>(Entry + SDKOffsets::LegacyNameEntryNameOffset);\n";
+    f << "            for (int32 I = 0; I < MaxLen; ++I) {\n";
+    f << "                if (Str[I] == '\\0') return Out;\n";
+    f << "                Out.push_back(Str[I]);\n";
+    f << "            }\n";
+    f << "            return {};\n";
+    f << "        }\n";
+    f << "        const uint32* Str = reinterpret_cast<const uint32*>(Entry + SDKOffsets::LegacyNameEntryNameOffset);\n";
+    f << "        for (int32 I = 0; I < MaxLen; ++I) {\n";
+    f << "            const uint32 Code = Str[I];\n";
+    f << "            if (Code == 0) return Out;\n";
+    f << "            Out.push_back(Code < 0x80 ? static_cast<char>(Code) : '?');\n";
+    f << "        }\n";
+    f << "        return {};\n";
     f << "    }\n";
     f << "    static std::string DecodeWideEntry(std::uintptr_t Entry, int32 Len, int32 Stride) {\n";
     f << "        std::string Out;\n";
@@ -3235,6 +3282,18 @@ INTERNAL bool WriteBasicHpp(const std::string& outDir) noexcept {
     f << "        return Score;\n";
     f << "    }\n";
     f << "    static std::string GetNameByIndex(int32 Index) {\n";
+    f << "        if constexpr (!SDKOffsets::GNamesUsesNamePool) {\n";
+    f << "            const std::uintptr_t Table = GetLegacyTable();\n";
+    f << "            if (!Table || Index < 0) return {};\n";
+    f << "            const int32 NumElements = *reinterpret_cast<const int32*>(Table + SDKOffsets::LegacyNameNumElementsOffset);\n";
+    f << "            if (Index >= NumElements) return {};\n";
+    f << "            void** Chunks = GetLegacyChunks();\n";
+    f << "            if (!Chunks) return {};\n";
+    f << "            const uint32 ChunkIndex = static_cast<uint32>(Index) >> SDKOffsets::LegacyNameChunkOffsetBits;\n";
+    f << "            const uint32 EntryIndex = static_cast<uint32>(Index) & SDKOffsets::LegacyNameChunkOffsetMask;\n";
+    f << "            void** Chunk = reinterpret_cast<void**>(Chunks[ChunkIndex]);\n";
+    f << "            return Chunk && Chunk[EntryIndex] ? DecodeLegacyEntry(reinterpret_cast<std::uintptr_t>(Chunk[EntryIndex])) : std::string{};\n";
+    f << "        }\n";
     f << "        void** Blocks = GetBlocksArray();\n";
     f << "        if (!Blocks || Index < 0) return {};\n";
     f << "        const uint32 Block = static_cast<uint32>(Index) >> SDKOffsets::FNamePoolBlockOffsetBits;\n";
@@ -3271,6 +3330,16 @@ INTERNAL bool WriteBasicHpp(const std::string& outDir) noexcept {
     f << "    }\n";
     f << "    static int32 FindNameIndex(const char* InName) {\n";
     f << "        if (!InName || !*InName) return 0;\n";
+    f << "        if constexpr (!SDKOffsets::GNamesUsesNamePool) {\n";
+    f << "            const std::uintptr_t Table = GetLegacyTable();\n";
+    f << "            if (!Table) return 0;\n";
+    f << "            const int32 NumElements = *reinterpret_cast<const int32*>(Table + SDKOffsets::LegacyNameNumElementsOffset);\n";
+    f << "            if (NumElements <= 0 || NumElements > 2 * 1024 * 1024) return 0;\n";
+    f << "            for (int32 Index = 0; Index < NumElements; ++Index) {\n";
+    f << "                if (GetNameByIndex(Index) == InName) return Index;\n";
+    f << "            }\n";
+    f << "            return 0;\n";
+    f << "        }\n";
     f << "        void** Blocks = GetBlocksArray();\n";
     f << "        if (!Blocks) return 0;\n";
     f << "        for (uint32 Block = 0; Block < 8192; ++Block) {\n";
@@ -4935,6 +5004,12 @@ INTERNAL bool WriteOffsetsLog(const std::string& rootDir) noexcept {
     f << "FNamePool.Stride = " << Hex32(Off::FNamePool::Stride) << "\n";
     f << "FNamePool.BlockOffsetBits = " << Off::FNamePool::BlockOffsetBits << "\n";
     f << "FNamePool.CasePreserving = " << (Off::InSDK::bIsCasePreserving ? "true" : "false") << "\n\n";
+    f << "GNames.UsesNamePool = " << (Off::InSDK::bUsesNamePool ? "true" : "false") << "\n";
+    if (!Off::InSDK::bUsesNamePool) {
+        f << "TNameEntryArray.ChunksOffset = " << Hex32(Off::TNameEntryArray::ChunksOffset) << "\n";
+        f << "TNameEntryArray.NumElementsOffset = " << Hex32(Off::TNameEntryArray::NumElementsOffset) << "\n";
+        f << "TNameEntryArray.ChunkOffsetBits = " << Off::TNameEntryArray::ChunkOffsetBits << "\n\n";
+    }
 
     f << "UStruct.SuperStruct = " << Hex32(Off::UStruct::SuperStruct) << "\n";
     f << "UStruct.Children = " << Hex32(Off::UStruct::Children) << "\n";
