@@ -45,7 +45,7 @@ namespace {
 // Persistent state across frames. The default output path is ARK-specific —
 // the user can edit before clicking Start.
 std::string g_outputDir =
-            "/sdcard/Android/media/" + GetPackageName() + "/SDK";
+            "/sdcard/Android/media/" + GetPackageName();  // SDKDumper writes into <this>/SDK
 
 }  // namespace
 

@@ -85,6 +85,84 @@ Because the dumper operates as an **internal library**, it must be injected into
 3. **Execution Hook:**
    Upon loading, a constructor attribute `payload_main()` triggers instantly, spawning a separate thread (`inject_thread`) to attach the Java VM, load the embedded Dex payloads from memory via `InMemoryDexClassLoader`, and invoke `com.sahilm9098.arkmodmenu.Loader.main()` to start the internal UI and hooks.
 
+### Headless (scripted) dump
+
+Set `debug.dumper7.autostart` to a number of seconds before injecting, and the dumper runs the whole
+pipeline (library, GObjects, GNames, offsets, dump) that long after it loads, without touching the
+overlay. Progress goes to `adb logcat -s Dumper7`; the dump ends with `[sdk] Finished phase=done`.
+
+```bash
+# rooted phone over adb; INJECTOR = an arm64 ptrace injector run as `injector <pid> <payload.so> <package>`
+INJECTOR=/path/to/injector tools/dump.sh output/libmenu.so ./dump-out 75 com.game.name
+```
+
+`tools/dump.sh` starts the game, waits for the main menu, stages the library in the game's own
+`lib/arm64` folder, injects it, waits for the dump, pulls `SDK/` as one archive and stops the game.
+
+### Native build without Gradle
+
+When Gradle cannot run (no wrapper download, other NDK), CMake builds `libmenu.so` directly
+(about a minute; uses the existing `dex_payload.h`):
+
+```bash
+cmake -G Ninja -DCMAKE_MAKE_PROGRAM=$ANDROID_HOME/cmake/3.22.1/bin/ninja \
+  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DANDROID_STL=c++_static \
+  -DCMAKE_BUILD_TYPE=Release app/src/main/cpp && ninja
+```
+
+---
+
+## ✅ Checking a dump
+
+Every generated struct and class carries `static_assert`s for each member offset and for its size
+(a struct must be exactly its properties size rounded up to the engine's alignment, since arrays
+step by it; a class must be its properties size rounded up to its own C++ alignment, because the
+engine's class alignment does not always match the C++ one). Parameter structs carry the same
+member checks. A dump that compiles therefore has the
+layout the engine reported, not just valid syntax:
+
+```bash
+tools/check_sdk.sh ./dump-out/SDK      # SDK.hpp + every Private/*_functions.cpp, NDK clang, syntax only
+```
+
+It prints `errors=0 warnings=0` on a good dump. `-Winvalid-offsetof` (offsetof on classes with a
+base) is silenced inside the generated headers: clang computes it right for the SDK's single,
+non-virtual inheritance.
+
+## 🧬 Engine versions
+
+Offsets that moved between engine versions are found from the running game, not from fixed
+defaults, so one build dumps both old (UProperty) and new (FProperty) engines:
+
+| Field | How it is found |
+| :--- | :--- |
+| `UStruct::SuperStruct`, `Children`, `PropertiesSize`, `ChildProperties` | Struct-layout finder (sampled classes, structs, functions). No `ChildProperties` before 4.25: properties are then UObjects on `Children` (the FField pass is skipped). |
+| `UStruct::MinAlignment` | `PropertiesSize + 4` (the two `int32`s sit together in every UE4/UE5 `UStruct`). |
+| `UClass::ClassFlags` / `ClassCastFlags` | By value: `UObject` is native+abstract, `UInterface` native+abstract+interface, Blueprint classes compiled-from-Blueprint. |
+| `UFunction::FunctionFlags` | By value: `FUNC_Native` is set on exactly the functions whose `Func` is not the interpreter entry all script functions share (`UObject::ProcessInternal`). |
+| `UFunction::NumParms` | By value: the byte after `FunctionFlags` that equals a native function's property count. |
+| UProperty / FProperty `ArrayDim`, `ElementSize`, `Offset_Internal`, subtype base | Property-layout finder. |
+
+Types that differ by version: before 4.18 soft references are `TAssetPtr<T>` / `TAssetSubclassOf<T>`
+(`AssetObjectProperty` / `AssetClassProperty`, 0x20: weak pointer + tag + `FStringAssetReference`);
+from 4.18 `TSoftObjectPtr<T>` / `TSoftClassPtr<T>` (0x28). `TSubclassOf<T>`, `TSoftClassPtr<T>` and
+`TAssetSubclassOf<T>` name the property's `MetaClass`. Containers whose layout is only known for one
+size (`TSet`/`TMap`, `FText`, delegates, lazy/soft pointers, `FFieldPath`) are typed only when the game
+reports that size, else emitted as an opaque block of the reported size.
+
+Dumped and checked with `tools/check_sdk.sh` (0 errors, 0 warnings), core offsets cross-checked
+against the engine's own code (`UObject::ProcessEvent`, `UStruct::Link`, `UFunction::Link` /
+`InitializeDerivedMembers`):
+
+| Game build | Engine | FunctionFlags / NumParms / Func | PropertiesSize / MinAlignment |
+| :--- | :--- | :--- | :--- |
+| ARK Mobile 2.0.29 | 4.17.2 | 0x88 / 0x8E / 0xB0 | 0x40 / 0x44 |
+| ARK: Ultimate Mobile Edition 1.10514 | 4.26.2 | 0xB0 / 0xB4 / 0xD8 | 0x58 / 0x5C |
+
+The **Direct Calls** option is not usable yet: it calls `UFunction::Func` (the exec thunk, which takes
+an `FFrame`) with a parameter buffer. Leave it off; function bodies go through `ProcessEvent`.
+
 ---
 
 ## 🔍 Technical Details: Reflection Root Search Strategies

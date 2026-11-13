@@ -1857,10 +1857,16 @@ void Apply(const AdvancedLayout& l) noexcept {
 
     if (l.classDefaultObject.offset >= 0)
         Off::UClass::ClassDefaultObject = l.classDefaultObject.offset;
-    if (l.childProperties.offset    >= 0)
-        Off::UStruct::ChildProperties   = l.childProperties.offset;
-    if (l.propertiesSize.offset     >= 0)
+    // No FField chain before 4.25: properties are UObjects on Children, and
+    // the 4.27 default (0x50) would read UStruct::Script there.
+    Off::UStruct::ChildProperties = l.childProperties.offset >= 0
+            ? l.childProperties.offset : -1;
+    if (l.propertiesSize.offset     >= 0) {
         Off::UStruct::PropertiesSize    = l.propertiesSize.offset;
+        // int32 PropertiesSize; int32 MinAlignment; sit together in every
+        // UE4/UE5 UStruct (4.17: 0x40/0x44, 4.26: 0x58/0x5C).
+        Off::UStruct::MinAlignment      = l.propertiesSize.offset + 4;
+    }
     if (l.funcFunc.offset           >= 0)
         Off::UFunction::Func            = l.funcFunc.offset;
     if (l.fFieldClassPrivate.offset >= 0)

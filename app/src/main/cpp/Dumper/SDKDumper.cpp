@@ -32,6 +32,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -48,10 +49,25 @@ namespace {
 // Inline UE read helpers (small enough to duplicate; avoids cross-TU coupling).
 // =============================================================================
 
+// Text of the FName stored at addr: its name-table entry, plus "_N" when the
+// FName carries a number. The engine stores "Foo_3" as the entry "Foo" with
+// Number 4, so without the number two different names read the same (the two
+// Blueprint functions "Evt_0" and "Evt_1" would both be "Evt").
 INTERNAL std::string ReadFNameAt(uintptr_t addr) noexcept {
     auto comp = SafeMemory::SafeReadAny<int32_t>(addr);
     if (!comp || *comp < 0 || *comp > 0x40000000) return {};
-    return UE::NameArray::GetName(*comp);
+    std::string name = UE::NameArray::GetName(*comp);
+    if (name.empty()) return name;
+
+    // FName is {ComparisonIndex, Number}; a case-preserving build has a
+    // DisplayIndex between the two.
+    const int32_t numberOffset = Off::InSDK::bIsCasePreserving ? 8 : 4;
+    auto number = SafeMemory::SafeReadAny<int32_t>(addr + numberOffset);
+    if (number && *number > 0) {
+        name += '_';
+        name += std::to_string(*number - 1);
+    }
+    return name;
 }
 INTERNAL std::string ReadObjectName(uintptr_t obj) noexcept {
     return ReadFNameAt(obj + Off::UObject::NamePrivate);
@@ -91,6 +107,7 @@ struct PackageInfo {
     uintptr_t              address = 0;
     std::string            name;
     std::string            displayName;
+    bool                   isScript = false;  // a native module (/Script/...), not content
     std::vector<uintptr_t> classes;
     std::vector<uintptr_t> structs;
     std::vector<uintptr_t> enums;
@@ -125,6 +142,28 @@ INTERNAL Kind ClassifyByName(const std::string& className) noexcept {
     if (className == "Function")     return Kind::Function;
     if (className == "Package")      return Kind::Package;
     return Kind::Other;
+}
+
+constexpr int32_t kMaxSuperDepth = 64;
+
+// What kind of reflection object an instance of `cls` is. The answer comes from
+// the class's super chain, not its own name, so the subclasses the engine uses
+// for Blueprint content are dumped too: BlueprintGeneratedClass (and the widget
+// and anim variants) are classes, UserDefinedStruct is a struct, UserDefinedEnum
+// an enum and DelegateFunction a function.
+INTERNAL Kind ClassifyByClassChain(uintptr_t cls) noexcept {
+    Kind kind = Kind::Other;
+    SafeMemory::ScopedSigSegvGuard guard;
+    guard.Try([&] {
+        uintptr_t cur = cls;
+        for (int32_t depth = 0; cur != 0 && depth < kMaxSuperDepth; ++depth) {
+            kind = ClassifyByName(ReadObjectName(cur));
+            if (kind != Kind::Other) return;
+            auto super = SafeMemory::SafeReadAny<uintptr_t>(cur + Off::UStruct::SuperStruct);
+            cur = super ? *super : 0;
+        }
+    });
+    return kind;
 }
 
 // =============================================================================
@@ -189,35 +228,59 @@ INTERNAL bool EnsurePropertyLayoutReady() noexcept {
 // Phase 1 — collection.
 // =============================================================================
 
+// A package's headers are named <stem>_classes.hpp and so on. The stem comes
+// from the package path, so it is cut to fit a file name (255 bytes with the
+// longest suffix) and made unique: "/Game/A_B" and "/Game/A/B" give the same
+// text and would otherwise overwrite each other's files.
+INTERNAL std::string UniquePackageFileStem(
+        std::string stem,
+        const std::string& packagePath,
+        std::unordered_set<std::string>& used) noexcept {
+    constexpr size_t kMaxStem = 180;
+    if (stem.size() > kMaxStem) {
+        uint32_t hash = 2166136261u;  // FNV-1a of the full path keeps the cut name stable
+        for (unsigned char c : packagePath) { hash ^= c; hash *= 16777619u; }
+        char tail[16];
+        std::snprintf(tail, sizeof(tail), "_%08X", hash);
+        stem.resize(kMaxStem);
+        stem += tail;
+    }
+    std::string unique = stem;
+    for (int32_t n = 2; !used.insert(unique).second; ++n) {
+        unique = stem + "_" + std::to_string(n);
+    }
+    return unique;
+}
+
 INTERNAL bool CollectObjects(std::vector<ObjMeta>& metas,
                              std::unordered_map<uintptr_t, PackageInfo>& packages) noexcept {
     SafeMemory::ScopedSigSegvGuard guard;
     int32_t total = UE::ObjectArray::Num();
     metas.reserve(static_cast<size_t>(total));
 
-    // Cache: class pointer → class name. Most objects share one of <500 classes,
-    // so caching collapses the per-object decode cost.
-    std::unordered_map<uintptr_t, std::string> classNameCache;
-    classNameCache.reserve(1024);
+    std::unordered_set<std::string> usedPackageStems;
 
-    auto classNameOf = [&](uintptr_t obj) -> std::string {
+    // Cache: class pointer → kind. Most objects share one of a few thousand
+    // classes, so caching collapses the per-object super-chain walk.
+    std::unordered_map<uintptr_t, Kind> classKindCache;
+    classKindCache.reserve(4096);
+
+    auto kindOf = [&](uintptr_t obj) -> Kind {
         uintptr_t cls = 0;
         guard.Try([&] { cls = ReadClassPtr(obj); });
-        if (cls == 0) return {};
-        auto it = classNameCache.find(cls);
-        if (it != classNameCache.end()) return it->second;
-        std::string n;
-        guard.Try([&] { n = ReadObjectName(cls); });
-        classNameCache.emplace(cls, n);
-        return n;
+        if (cls == 0) return Kind::Other;
+        auto it = classKindCache.find(cls);
+        if (it != classKindCache.end()) return it->second;
+        Kind kind = ClassifyByClassChain(cls);
+        classKindCache.emplace(cls, kind);
+        return kind;
     };
 
     UE::ObjectArray::ForEach([&](UE::UObject* obj) {
         if (g_cancel.load()) return;
         uintptr_t addr = reinterpret_cast<uintptr_t>(obj);
 
-        std::string clsName = classNameOf(addr);
-        Kind kind = ClassifyByName(clsName);
+        Kind kind = kindOf(addr);
         if (kind == Kind::Other) return;  // not a reflection object
 
         ObjMeta m;
@@ -239,7 +302,7 @@ INTERNAL bool CollectObjects(std::vector<ObjMeta>& metas,
                 uintptr_t outer = 0;
                 guard.Try([&] { outer = ReadOuter(cur); });
                 if (outer == 0) break;
-                if (classNameOf(outer) == "Package") { pkg = outer; break; }
+                if (kindOf(outer) == Kind::Package) { pkg = outer; break; }
                 cur = outer;
             }
         }
@@ -247,7 +310,7 @@ INTERNAL bool CollectObjects(std::vector<ObjMeta>& metas,
         m.outerPackage = pkg;
 
         // SuperStruct + PropertiesSize + MinAlignment: UStruct fields.
-        // ClassFlags: UClass-specific (Abstract, Interface, Config, etc.)
+        // ClassFlags are read after collection, by ResolveClassFlags.
         if (kind == Kind::Class || kind == Kind::Struct || kind == Kind::Function) {
             guard.Try([&] {
                 auto super = SafeMemory::SafeReadAny<uintptr_t>(
@@ -260,13 +323,6 @@ INTERNAL bool CollectObjects(std::vector<ObjMeta>& metas,
                         addr + Off::UStruct::MinAlignment);
                 if (align && *align > 0 && *align <= 128) m.minAlignment = *align;
             });
-            if (kind == Kind::Class) {
-                guard.Try([&] {
-                    auto flags = SafeMemory::SafeReadAny<uint32_t>(
-                            addr + Off::UClass::ClassFlags);
-                    if (flags) m.classFlags = *flags;
-                });
-            }
         }
 
         // Register the package once.
@@ -276,6 +332,7 @@ INTERNAL bool CollectObjects(std::vector<ObjMeta>& metas,
             std::string raw;
             guard.Try([&] { raw = ReadObjectName(pkg); });
             p.displayName = CleanUnrealDisplayPath(raw);
+            p.isScript = raw.rfind("/Script/", 0) == 0;
             // UE package names are paths like "/Script/Engine" or "/Game/Foo".
             // Strip the leading slashes so files become "Script_Engine_classes.hpp"
             // rather than "_Script_Engine_classes.hpp".
@@ -289,7 +346,7 @@ INTERNAL bool CollectObjects(std::vector<ObjMeta>& metas,
                 else safe += c;
             }
             if (safe.empty()) safe = "UnnamedPackage";
-            p.name = safe;
+            p.name = UniquePackageFileStem(safe, raw, usedPackageStems);
             if (p.displayName.empty()) p.displayName = safe;
             packages.emplace(pkg, std::move(p));
         }
@@ -335,6 +392,243 @@ INTERNAL bool CollectObjects(std::vector<ObjMeta>& metas,
         packages[m.outerPackage].dependsOn.insert(it->second);
     }
     return !metas.empty();
+}
+
+// =============================================================================
+// UClass::ClassFlags.
+// =============================================================================
+
+// EClassFlags bits the dumper reads (the values are the same in every UE4/UE5).
+constexpr uint32_t CLASS_Abstract              = 0x00000001U;
+constexpr uint32_t CLASS_Config                = 0x00000004U;
+constexpr uint32_t CLASS_Transient             = 0x00000008U;
+constexpr uint32_t CLASS_Native                = 0x00000080U;
+constexpr uint32_t CLASS_Interface             = 0x00004000U;
+constexpr uint32_t CLASS_CompiledFromBlueprint = 0x00040000U;
+constexpr uint32_t CLASS_Deprecated            = 0x02000000U;
+
+// EClassCastFlags of UClass itself: UField | UStruct | UClass.
+constexpr uint64_t CASTCLASS_OfUClass = 0x1ULL | 0x8ULL | 0x20ULL;
+
+// True once ResolveClassFlags has found UClass::ClassFlags in this build. While
+// false the flags are unknown, and no class flag is written anywhere.
+bool    g_classFlagsKnown      = false;
+// UClass::ClassCastFlags (uint64), or -1 when it was not confirmed.
+int32_t g_classCastFlagsOffset = -1;
+
+// Finds UClass::ClassFlags and fills ObjMeta::classFlags. The offset moves
+// between engine versions (UStruct grew in 4.25), so it is found by value: at
+// the right offset the classes every engine has carry known flags (UObject is
+// native and abstract, UInterface is a native abstract interface, AActor is
+// native and concrete) and a Blueprint class is compiled-from-Blueprint and
+// not native. UObject and UInterface must both match; the rest only rank.
+INTERNAL void ResolveClassFlags(std::vector<ObjMeta>& metas) noexcept {
+    g_classFlagsKnown = false;
+    g_classCastFlagsOffset = -1;
+
+    uintptr_t objectCls = 0, interfaceCls = 0, classCls = 0, actorCls = 0;
+    std::vector<uintptr_t> blueprintClasses;
+    for (const auto& m : metas) {
+        if (m.kind != Kind::Class) continue;
+        if      (m.name == "Object"    && !objectCls)    objectCls    = m.address;
+        else if (m.name == "Interface" && !interfaceCls) interfaceCls = m.address;
+        else if (m.name == "Class"     && !classCls)     classCls     = m.address;
+        else if (m.name == "Actor"     && !actorCls)     actorCls     = m.address;
+        else if (blueprintClasses.size() < 16 &&
+                 ReadObjectClassName(m.address) != "Class") {
+            blueprintClasses.push_back(m.address);  // a UClass subclass made it
+        }
+    }
+    if (!objectCls || !interfaceCls) {
+        DLOGW("[sdk][classflags] UObject/UInterface class not found; flags stay unknown");
+        return;
+    }
+
+    SafeMemory::ScopedSigSegvGuard guard;
+    auto flagsAt = [&](uintptr_t cls, int32_t off, uint32_t& out) -> bool {
+        bool ok = false;
+        guard.Try([&] {
+            auto v = SafeMemory::SafeReadAny<uint32_t>(cls + off);
+            if (v) { out = *v; ok = true; }
+        });
+        return ok;
+    };
+    auto all  = [](uint32_t v, uint32_t bits) { return (v & bits) == bits; };
+    auto none = [](uint32_t v, uint32_t bits) { return (v & bits) == 0; };
+
+    const int32_t begin = (Off::UStruct::MinAlignment + 4 + 3) & ~3;
+    const int32_t end   = Off::UClass::ClassDefaultObject;
+    int32_t bestOff = -1;
+    int32_t bestScore = 0;
+    for (int32_t off = begin; off + 4 <= end; off += 4) {
+        uint32_t object = 0, iface = 0, v = 0;
+        if (!flagsAt(objectCls, off, object) || !flagsAt(interfaceCls, off, iface)) continue;
+        if (!all(object, CLASS_Native | CLASS_Abstract) ||
+            !none(object, CLASS_Interface | CLASS_CompiledFromBlueprint)) continue;
+        if (!all(iface, CLASS_Native | CLASS_Abstract | CLASS_Interface) ||
+            !none(iface, CLASS_CompiledFromBlueprint)) continue;
+
+        int32_t score = 1;
+        if (classCls && flagsAt(classCls, off, v) && all(v, CLASS_Native) &&
+            none(v, CLASS_Interface | CLASS_CompiledFromBlueprint)) score += 2;
+        if (actorCls && flagsAt(actorCls, off, v) && all(v, CLASS_Native) &&
+            none(v, CLASS_Abstract | CLASS_Interface | CLASS_CompiledFromBlueprint)) score += 2;
+        for (uintptr_t bp : blueprintClasses) {
+            if (flagsAt(bp, off, v) && all(v, CLASS_CompiledFromBlueprint) &&
+                none(v, CLASS_Native)) ++score;
+        }
+        if (score > bestScore) { bestScore = score; bestOff = off; }
+    }
+    if (bestOff < 0) {
+        DLOGW("[sdk][classflags] no offset in [0x%x, 0x%x) matches; flags stay unknown",
+              begin, end);
+        return;
+    }
+
+    Off::UClass::ClassFlags = bestOff;
+    g_classFlagsKnown = true;
+    for (auto& m : metas) {
+        if (m.kind == Kind::Class) flagsAt(m.address, bestOff, m.classFlags);
+    }
+
+    // ClassCastFlags is the uint64 after ClassFlags. Accepted only when UClass
+    // itself reads as a class there and UObject reads as nothing.
+    const int32_t castOff = (bestOff + 4 + 7) & ~7;
+    if (classCls && castOff + 8 <= end) {
+        guard.Try([&] {
+            auto ofClass  = SafeMemory::SafeReadAny<uint64_t>(classCls + castOff);
+            auto ofObject = SafeMemory::SafeReadAny<uint64_t>(objectCls + castOff);
+            if (ofClass && ofObject && *ofObject == 0 &&
+                (*ofClass & CASTCLASS_OfUClass) == CASTCLASS_OfUClass) {
+                g_classCastFlagsOffset = castOff;
+            }
+        });
+    }
+    DLOGI("[sdk][classflags] ClassFlags=0x%x (score %d) ClassCastFlags=0x%x",
+          bestOff, bestScore, g_classCastFlagsOffset);
+}
+
+// Finds UFunction::FunctionFlags and NumParms by value. They follow UStruct,
+// which grew in 4.25: 4.17 has FunctionFlags 0x88, a uint16 RepOffset, then
+// NumParms 0x8E; 4.26 has 0xB0 / 0xB4. FunctionFlags is where FUNC_Native is
+// set on exactly the functions whose Func is not the interpreter entry every
+// script function shares (UObject::ProcessInternal, the most common Func).
+// NumParms is the byte after it that counts a native function's properties
+// (a native function has no locals, so every property is a parameter).
+INTERNAL void ResolveFunctionLayout(const std::vector<ObjMeta>& metas) noexcept {
+    // Sample across the whole object list: the first functions are mostly
+    // native (CoreUObject, Engine), the last mostly Blueprint.
+    std::vector<const ObjMeta*> all;
+    for (const auto& m : metas) {
+        if (m.kind == Kind::Function) all.push_back(&m);
+    }
+    if (all.size() < 64) {
+        DLOGW("[sdk][funclayout] only %zu functions; keeping FunctionFlags=0x%x NumParms=0x%x",
+              all.size(), Off::UFunction::FunctionFlags, Off::UFunction::NumParms);
+        return;
+    }
+    const size_t stride = all.size() > 4096 ? all.size() / 4096 : 1;
+    std::vector<const ObjMeta*> fns;
+    for (size_t i = 0; i < all.size(); i += stride) fns.push_back(all[i]);
+
+    SafeMemory::ScopedSigSegvGuard guard;
+    auto readAt = [&](uintptr_t addr, auto& out) -> bool {
+        using T = std::remove_reference_t<decltype(out)>;
+        bool ok = false;
+        guard.Try([&] {
+            auto v = SafeMemory::SafeReadAny<T>(addr);
+            if (v) { out = *v; ok = true; }
+        });
+        return ok;
+    };
+
+    std::vector<uintptr_t> funcOf(fns.size(), 0);
+    std::unordered_map<uintptr_t, int32_t> funcCount;
+    for (size_t i = 0; i < fns.size(); ++i) {
+        uintptr_t v = 0;
+        if (readAt(fns[i]->address + Off::UFunction::Func, v) && v) {
+            funcOf[i] = v;
+            ++funcCount[v];
+        }
+    }
+    uintptr_t scriptEntry = 0;
+    int32_t scriptCount = 0;
+    for (const auto& kv : funcCount) {
+        if (kv.second > scriptCount) { scriptCount = kv.second; scriptEntry = kv.first; }
+    }
+    int32_t withFunc = 0;
+    for (uintptr_t v : funcOf) if (v) ++withFunc;
+    const int32_t nativeCount = withFunc - scriptCount;
+    if (scriptCount < 16 || nativeCount < 16) {
+        DLOGW("[sdk][funclayout] script/native split unclear (%d/%d); keeping defaults",
+              scriptCount, nativeCount);
+        return;
+    }
+
+    // FunctionFlags: after UStruct's PropertiesSize/MinAlignment, before Func.
+    const int32_t begin = (Off::UStruct::MinAlignment + 4 + 3) & ~3;
+    const int32_t end   = Off::UFunction::Func;
+    int32_t bestFlags = -1, bestFlagsScore = 0;
+    for (int32_t off = begin; off + 4 <= end; off += 4) {
+        int32_t score = 0;
+        for (size_t i = 0; i < fns.size(); ++i) {
+            if (!funcOf[i]) continue;
+            uint32_t v = 0;
+            if (!readAt(fns[i]->address + off, v)) continue;
+            const bool native = (v & 0x400U) != 0;  // FUNC_Native (declared further down)
+            if (native == (funcOf[i] != scriptEntry)) ++score;
+        }
+        if (score > bestFlagsScore) { bestFlagsScore = score; bestFlags = off; }
+    }
+    if (bestFlags < 0 || bestFlagsScore * 100 < withFunc * 98) {
+        DLOGW("[sdk][funclayout] FunctionFlags not found (best 0x%x %d/%d); keeping 0x%x",
+              bestFlags, bestFlagsScore, withFunc, Off::UFunction::FunctionFlags);
+        return;
+    }
+    Off::UFunction::FunctionFlags = bestFlags;
+
+    // NumParms: the byte that equals a native function's property count.
+    auto countProperties = [&](uintptr_t fn) -> int32_t {
+        const bool fields = Off::UStruct::ChildProperties >= 0;
+        const int32_t head = fields ? Off::UStruct::ChildProperties : Off::UStruct::Children;
+        const int32_t next = fields ? Off::FField::Next : Off::UField::Next;
+        int32_t n = 0;
+        uintptr_t cur = 0;
+        readAt(fn + head, cur);
+        while (cur && n < 256) {
+            ++n;
+            uintptr_t nxt = 0;
+            if (!readAt(cur + next, nxt)) return -1;
+            cur = nxt;
+        }
+        return n;
+    };
+    std::vector<int32_t> counts(fns.size(), -1);
+    int32_t natives = 0;
+    for (size_t i = 0; i < fns.size(); ++i) {
+        if (!funcOf[i] || funcOf[i] == scriptEntry) continue;
+        counts[i] = countProperties(fns[i]->address);
+        if (counts[i] >= 0) ++natives;
+    }
+    int32_t bestNum = -1, bestNumScore = 0;
+    for (int32_t off = bestFlags + 4; off < bestFlags + 8; ++off) {
+        int32_t score = 0;
+        for (size_t i = 0; i < fns.size(); ++i) {
+            if (counts[i] < 0) continue;
+            uint8_t v = 0;
+            if (readAt(fns[i]->address + off, v) && v == counts[i]) ++score;
+        }
+        if (score > bestNumScore) { bestNumScore = score; bestNum = off; }
+    }
+    if (bestNum >= 0 && natives > 0 && bestNumScore * 100 >= natives * 98) {
+        Off::UFunction::NumParms = bestNum;
+    } else {
+        DLOGW("[sdk][funclayout] NumParms not found (best 0x%x %d/%d); keeping 0x%x",
+              bestNum, bestNumScore, natives, Off::UFunction::NumParms);
+    }
+    DLOGI("[sdk][funclayout] FunctionFlags=0x%x (%d/%d) NumParms=0x%x (%d/%d) Func=0x%x",
+          Off::UFunction::FunctionFlags, bestFlagsScore, withFunc,
+          Off::UFunction::NumParms, bestNumScore, natives, Off::UFunction::Func);
 }
 
 // =============================================================================
@@ -419,6 +713,7 @@ constexpr uint64_t CPF_Transient     = 0x0000000000002000ULL;
 constexpr uint64_t CPF_RepNotify     = 0x0000000100000000ULL;
 constexpr uint64_t CPF_SaveGame      = 0x0000000001000000ULL;
 
+constexpr uint32_t FUNC_Native = 0x00000400U;
 constexpr uint32_t FUNC_Static = 0x00002000U;
 
 // Build a short metadata tag string from property flags.
@@ -460,10 +755,7 @@ INTERNAL std::string ReadFieldClassName(
 INTERNAL std::string ReadFieldNameAt(uintptr_t fieldAddr, int32_t nameOff) noexcept {
     SafeMemory::ScopedSigSegvGuard guard;
     std::string name;
-    guard.Try([&] {
-        auto comp = SafeMemory::SafeReadAny<int32_t>(fieldAddr + nameOff);
-        if (comp) name = UE::NameArray::GetName(*comp);
-    });
+    guard.Try([&] { name = ReadFNameAt(fieldAddr + nameOff); });
     return name;
 }
 
@@ -478,13 +770,15 @@ INTERNAL bool IsPropertyTypeName(const std::string& name) noexcept {
            name == "ObjectProperty" || name == "ClassProperty" ||
            name == "WeakObjectProperty" || name == "LazyObjectProperty" ||
            name == "SoftObjectProperty" || name == "SoftClassProperty" ||
+           name == "AssetObjectProperty" || name == "AssetClassProperty" ||
            name == "InterfaceProperty" || name == "StructProperty" ||
            name == "EnumProperty" || name == "ArrayProperty" ||
            name == "SetProperty" || name == "MapProperty" ||
            name == "DelegateProperty" || name == "MulticastDelegateProperty" ||
            name == "MulticastInlineDelegateProperty" ||
            name == "MulticastSparseDelegateProperty" ||
-           name == "FieldPathProperty";
+           name == "FieldPathProperty" ||
+           name == "ObjectPtrProperty" || name == "ClassPtrProperty";
 }
 
 INTERNAL bool IsLikelyMemberName(const std::string& name) noexcept {
@@ -495,16 +789,17 @@ INTERNAL bool IsLikelyMemberName(const std::string& name) noexcept {
     if (name == "None" || name == "Class" || name == "Function" ||
         name == "ScriptStruct" || name == "Package") return false;
 
-    bool sawAlpha = false;
+    // A Blueprint variable name is free text ("Max Health", "Is Riding?", or
+    // not ASCII at all), and SanitizeIdent turns any of it into an identifier.
+    // What is refused is what a name read from a wrong offset looks like:
+    // control bytes, or an object path.
+    bool sawLetter = false;
     for (unsigned char c : name) {
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) sawAlpha = true;
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-            (c >= '0' && c <= '9') || c == '_') {
-            continue;
-        }
-        return false;
+        if (c < 0x20 || c == 0x7F) return false;
+        if (c == '/' || c == '\\' || c == ':' || c == '.') return false;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c >= 0x80) sawLetter = true;
     }
-    return sawAlpha;
+    return sawLetter;
 }
 
 INTERNAL std::string ReadFieldName(uintptr_t fieldAddr) noexcept {
@@ -525,6 +820,113 @@ INTERNAL std::string ReadFieldName(uintptr_t fieldAddr) noexcept {
         }
     }
     return primary;
+}
+
+// =============================================================================
+// C++ type names.
+// One table gives every collected class, struct and enum its final C++ name, so
+// a declaration and every reference to it agree. BuildCppTypeNames fills it
+// once per dump, before anything is written.
+// =============================================================================
+
+std::unordered_map<uintptr_t, std::string> g_cppNames;
+
+INTERNAL bool IsPredefinedStructName(const std::string& name) noexcept;
+
+// UE names an enum by its C++ name, which already has the E ("EAxis",
+// "E_UserDefined"); only a name without it gets the prefix.
+INTERNAL std::string EnumCppName(const std::string& rawName) noexcept {
+    const std::string safe = SanitizeIdent(rawName);
+    const bool hasPrefix = safe.size() > 1 && safe[0] == 'E' &&
+            ((safe[1] >= 'A' && safe[1] <= 'Z') || (safe[1] >= '0' && safe[1] <= '9') ||
+             safe[1] == '_');
+    return hasPrefix ? safe : "E" + safe;
+}
+
+// A class is an actor, and takes the A prefix, when AActor is anywhere in its
+// super chain. The walk goes to the root because a fork may put its own UObject
+// class under AActor (ARK: AActor : UPrimalActor), and it reads memory so it
+// also works for a class that was not collected.
+INTERNAL bool IsActorClass(uintptr_t classAddr) noexcept {
+    bool isActor = false;
+    SafeMemory::ScopedSigSegvGuard guard;
+    guard.Try([&] {
+        uintptr_t cur = classAddr;
+        for (int32_t depth = 0; cur != 0 && depth < kMaxSuperDepth; ++depth) {
+            if (ReadObjectName(cur) == "Actor") { isActor = true; return; }
+            auto super = SafeMemory::SafeReadAny<uintptr_t>(cur + Off::UStruct::SuperStruct);
+            cur = super ? *super : 0;
+        }
+    });
+    return isActor;
+}
+
+// The C++ name a reflection object gets before it is made unique.
+INTERNAL std::string CppNameFor(Kind kind, uintptr_t addr,
+                                const std::string& rawName) noexcept {
+    switch (kind) {
+        case Kind::Class: return (IsActorClass(addr) ? "A" : "U") + SanitizeIdent(rawName);
+        case Kind::Enum:  return EnumCppName(rawName);
+        default:          return "F" + SanitizeIdent(rawName);
+    }
+}
+
+INTERNAL std::string CppNameOf(const ObjMeta& m) noexcept {
+    auto it = g_cppNames.find(m.address);
+    return it != g_cppNames.end() ? it->second : CppNameFor(m.kind, m.address, m.name);
+}
+
+// Names Basic.hpp and Containers.hpp define themselves. A reflected type that
+// would get one of them is given a suffix instead of redefining it.
+INTERNAL std::unordered_set<std::string> ReservedCppNames() noexcept {
+    return {
+        "FName", "FString", "FText", "FWeakObjectPtr", "FLazyObjectPtr",
+        "FSoftObjectPtr", "FScriptInterface", "FScriptDelegate",
+        "FMulticastScriptDelegate", "FMulticastSparseDelegate", "FFieldPath",
+        "FBitArray", "FUObjectItem", "FFixedUObjectArray",
+        "FChunkedFixedUObjectArray", "FUObjectArray", "EObjectFlags",
+        "EFunctionFlags",
+    };
+}
+
+// Fills g_cppNames. Two types may share a name (two Blueprint assets called the
+// same in different folders): each still gets its own C++ name, the later one
+// with a numeric suffix. Native (/Script/) types are named first so the suffix
+// lands on the content type, and within a group the object array order decides,
+// which is the same from one run of a build to the next.
+INTERNAL void BuildCppTypeNames(
+        const std::vector<ObjMeta>& metas,
+        const std::unordered_map<uintptr_t, PackageInfo>& packages) noexcept {
+    g_cppNames.clear();
+    g_cppNames.reserve(metas.size());
+    std::unordered_set<std::string> used = ReservedCppNames();
+
+    auto isNative = [&](const ObjMeta& m) {
+        auto it = packages.find(m.outerPackage);
+        return it != packages.end() && it->second.isScript;
+    };
+
+    for (const bool nativePass : { true, false }) {
+        for (const auto& m : metas) {
+            if (m.kind != Kind::Class && m.kind != Kind::Struct && m.kind != Kind::Enum) continue;
+            if (isNative(m) != nativePass) continue;
+
+            const std::string base = CppNameFor(m.kind, m.address, m.name);
+            if (m.kind == Kind::Struct && IsPredefinedStructName(m.name)) {
+                g_cppNames[m.address] = base;  // stands for the type Containers.hpp defines
+                continue;
+            }
+            std::string unique = base;
+            for (int32_t n = 1; !used.insert(unique).second; ++n) {
+                unique = base + "_" + std::to_string(n);
+            }
+            if (unique != base) {
+                DLOGI("[sdk][names] %s is taken; %s is emitted as %s",
+                      base.c_str(), m.name.c_str(), unique.c_str());
+            }
+            g_cppNames[m.address] = unique;
+        }
+    }
 }
 
 // Forward decl — ResolveTypeName recurses into ResolveSubproperty for
@@ -615,40 +1017,31 @@ INTERNAL std::string ResolveTypeName(
         return p;
     };
 
-    auto namedTarget = [&](uintptr_t addr,
-                           char prefix,
-                           const char* fallback,
-                           const char* expectedClass) -> std::string {
+    // C++ name of the class, struct or enum a property points at. A collected
+    // target takes its name from the table; one that was not collected (it has
+    // no package) is named from memory by the same rules.
+    auto namedTarget = [&](uintptr_t addr, Kind expected,
+                           const char* fallback) -> std::string {
         if (addr == 0) return fallback;
         auto it = byAddr.find(addr);
         if (it != byAddr.end()) {
-            std::string out; out += prefix;
-            out += SanitizeIdent(it->second->name);
-            return out;
+            return it->second->kind == expected ? CppNameOf(*it->second) : fallback;
         }
 
-        std::string clsName;
+        uintptr_t cls = 0;
         std::string objName;
-        guard.Try([&] {
-            clsName = ReadObjectClassName(addr);
-            if (!expectedClass || clsName == expectedClass) {
-                objName = ReadObjectName(addr);
-            }
-        });
-        if (expectedClass && clsName != expectedClass) return fallback;
+        guard.Try([&] { cls = ReadClassPtr(addr); });
+        if (cls == 0 || ClassifyByClassChain(cls) != expected) return fallback;
+        guard.Try([&] { objName = ReadObjectName(addr); });
         if (!IsLikelyMemberName(objName)) return fallback;
 
         static std::atomic<int> directTargetLogs{0};
         int logIndex = directTargetLogs.fetch_add(1, std::memory_order_relaxed);
         if (logIndex < 24) {
-            DLOGI("[sdk][type] direct target name: expected=%s target=0x%lx name=%s",
-                  expectedClass ? expectedClass : "?",
+            DLOGI("[sdk][type] direct target name: target=0x%lx name=%s",
                   static_cast<unsigned long>(addr), objName.c_str());
         }
-
-        std::string out; out += prefix;
-        out += SanitizeIdent(objName);
-        return out;
+        return CppNameFor(expected, addr, objName);
     };
 
     int32_t subtypeBase = PropertySubtypeBase(legacyProperty);
@@ -656,43 +1049,56 @@ INTERNAL std::string ResolveTypeName(
     const int32_t subSlot1 = subtypeBase + (int32_t)sizeof(uintptr_t);
 
     if (propClass == "ByteProperty") {
-        return namedTarget(readPtrAt(subSlot0), 'E', "uint8_t", "Enum");
+        return namedTarget(readPtrAt(subSlot0), Kind::Enum, "uint8_t");
     }
-    if (propClass == "ObjectProperty") {
-        return ClassType(namedTarget(readPtrAt(subSlot0), 'U', "UObject", "Class")) + "*";
+    if (propClass == "ObjectProperty" || propClass == "ObjectPtrProperty") {
+        return ClassType(namedTarget(readPtrAt(subSlot0), Kind::Class, "UObject")) + "*";
     }
-    if (propClass == "ClassProperty") {
+    // Class properties: slot 0 is PropertyClass (always UClass); the class the
+    // value must derive from is MetaClass in slot 1 (FClassProperty and
+    // FSoftClassProperty in 4.25+, UClassProperty / UAssetClassProperty before).
+    if (propClass == "ClassProperty" || propClass == "ClassPtrProperty") {
         return "TSubclassOf<" +
-               ClassType(namedTarget(readPtrAt(subSlot0), 'U', "UObject", "Class")) + ">";
+               ClassType(namedTarget(readPtrAt(subSlot1), Kind::Class, "UObject")) + ">";
     }
     if (propClass == "WeakObjectProperty") {
         return "TWeakObjectPtr<" +
-               ClassType(namedTarget(readPtrAt(subSlot0), 'U', "UObject", "Class")) + ">";
+               ClassType(namedTarget(readPtrAt(subSlot0), Kind::Class, "UObject")) + ">";
     }
     if (propClass == "LazyObjectProperty") {
-        return "TWeakObjectPtr<" +
-               ClassType(namedTarget(readPtrAt(subSlot0), 'U', "UObject", "Class")) + ">";
+        return "TLazyObjectPtr<" +
+               ClassType(namedTarget(readPtrAt(subSlot0), Kind::Class, "UObject")) + ">";
     }
     if (propClass == "SoftObjectProperty") {
         return "TSoftObjectPtr<" +
-               ClassType(namedTarget(readPtrAt(subSlot0), 'U', "UObject", "Class")) + ">";
+               ClassType(namedTarget(readPtrAt(subSlot0), Kind::Class, "UObject")) + ">";
     }
     if (propClass == "SoftClassProperty") {
         return "TSoftClassPtr<" +
-               ClassType(namedTarget(readPtrAt(subSlot0), 'U', "UObject", "Class")) + ">";
+               ClassType(namedTarget(readPtrAt(subSlot1), Kind::Class, "UObject")) + ">";
+    }
+    // Soft references before 4.18 (TAssetPtr / TAssetSubclassOf): the same
+    // slots as SoftObjectProperty / SoftClassProperty, an older layout.
+    if (propClass == "AssetObjectProperty") {
+        return "TAssetPtr<" +
+               ClassType(namedTarget(readPtrAt(subSlot0), Kind::Class, "UObject")) + ">";
+    }
+    if (propClass == "AssetClassProperty") {
+        return "TAssetSubclassOf<" +
+               ClassType(namedTarget(readPtrAt(subSlot1), Kind::Class, "UObject")) + ">";
     }
     if (propClass == "InterfaceProperty") {
         // InterfaceProperty is backed by FScriptInterface (UObject* + void*),
         // so it must be emitted as a 16-byte TScriptInterface<T>, not a plain
         // pointer (which would be 8 bytes and break member offsets).
         return "TScriptInterface<" +
-               ClassType(namedTarget(readPtrAt(subSlot0), 'U', "UObject", "Class")) + ">";
+               ClassType(namedTarget(readPtrAt(subSlot0), Kind::Class, "UObject")) + ">";
     }
     if (propClass == "StructProperty") {
-        return StructType(namedTarget(readPtrAt(subSlot0), 'F', "uint8_t", "ScriptStruct"));
+        return StructType(namedTarget(readPtrAt(subSlot0), Kind::Struct, "uint8_t"));
     }
     if (propClass == "EnumProperty") {
-        return namedTarget(readPtrAt(subSlot1), 'E', "uint8_t", "Enum");
+        return namedTarget(readPtrAt(subSlot1), Kind::Enum, "uint8_t");
     }
     if (propClass == "ArrayProperty") {
         return "TArray<" +
@@ -715,7 +1121,7 @@ INTERNAL std::string ResolveTypeName(
                                            legacyProperty);
         return "TMap<" + k + ", " + v + ">";
     }
-    if (propClass == "FieldPathProperty") return "void*";
+    if (propClass == "FieldPathProperty") return "FFieldPath";
 
     return "uint8_t";  // unknown — emit a single byte and let elementSize set the size
 }
@@ -859,12 +1265,64 @@ INTERNAL void CollectPropertyTypeTargets(
     }
 }
 
+// Number of bits a bool property's mask covers, counted up from its lowest bit.
+INTERNAL int32_t BitWidth(uint8_t mask) noexcept {
+    const int32_t first = BitIndex(mask);
+    int32_t width = 0;
+    while (first + width < 8 && (mask & (uint8_t)(1u << (first + width)))) ++width;
+    return width > 0 ? width : 1;
+}
+
+// Writes every bit-field bool that lives in the byte at props[i].offset and
+// moves i past them. C++ packs consecutive bit-fields from bit 0 upward, so a
+// member lands on its real bit only if the bits the engine did not reflect are
+// declared too: a gap gets a BitPad member, and so does the rest of the byte,
+// because otherwise the next byte's bit-fields would be packed into this one.
+template <class NameFn>
+INTERNAL void EmitBitfieldByte(std::ofstream& f,
+                               const std::vector<PropertyInfo>& props,
+                               size_t& i,
+                               NameFn&& emitName) noexcept {
+    const int32_t byteOffset = props[i].offset;
+    int32_t bit = 0;
+    auto padTo = [&](int32_t upTo) {
+        if (upTo <= bit) return;
+        f << "    uint8_t BitPad_" << std::hex << std::uppercase << byteOffset
+          << std::dec << "_" << bit << " : " << (upTo - bit) << ";\n";
+        bit = upTo;
+    };
+
+    while (i < props.size() && props[i].isBitfield && props[i].offset == byteOffset) {
+        const auto& bp = props[i];
+        const int32_t first = BitIndex(bp.boolMask);
+        const int32_t width = BitWidth(bp.boolMask);
+        const std::string name = emitName(bp);
+        if (first < bit) {
+            // A second property on a bit that is already declared.
+            f << "    // uint8_t " << name << " : " << width << ";  // shares a bit @ 0x"
+              << std::hex << std::uppercase << bp.offset << " (mask=0x"
+              << (int)bp.boolMask << ")" << std::dec << "\n";
+        } else {
+            padTo(first);
+            f << "    uint8_t " << name << " : " << width << ";  // 0x"
+              << std::hex << std::uppercase << bp.offset << " (mask=0x"
+              << (int)bp.boolMask << ", size=0x1)" << std::dec << "\n";
+            bit = first + width;
+        }
+        ++i;
+    }
+    padTo(8);
+}
+
 // Dynamic sizes detected from reflection data for standard UE types.
 // Used during header generation to ensure sizes match the active game engine.
 INTERNAL struct DetectedSdkSizes {
     int32_t text = 0;
     int32_t softObjectPath = 0;
     int32_t softObjectPtr = 0;
+    int32_t assetPtr = 0;       // TAssetPtr (4.17 and older)
+    int32_t lazyObjectPtr = 0;
+    int32_t fieldPath = 0;
     int32_t scriptDelegate = 0;
     int32_t multicastScriptDelegate = 0;
     int32_t multicastSparseDelegate = 0;
@@ -922,6 +1380,13 @@ INTERNAL std::vector<PropertyInfo> CollectStructProperties(
         } else if (clsName == "SoftObjectProperty" ||
                    clsName == "SoftClassProperty") {
             AcceptDetectedSize(g_detectedSizes.softObjectPtr, p.elementSize);
+        } else if (clsName == "AssetObjectProperty" ||
+                   clsName == "AssetClassProperty") {
+            AcceptDetectedSize(g_detectedSizes.assetPtr, p.elementSize);
+        } else if (clsName == "LazyObjectProperty") {
+            AcceptDetectedSize(g_detectedSizes.lazyObjectPtr, p.elementSize);
+        } else if (clsName == "FieldPathProperty") {
+            AcceptDetectedSize(g_detectedSizes.fieldPath, p.elementSize);
         } else if (clsName == "DelegateProperty") {
             AcceptDetectedSize(g_detectedSizes.scriptDelegate, p.elementSize);
         } else if (clsName == "MulticastDelegateProperty" ||
@@ -939,7 +1404,7 @@ INTERNAL std::vector<PropertyInfo> CollectStructProperties(
     };
 
     // ---- Pass 1: ChildProperties (FField/FProperty — UE4.25+ new path) ----
-    {
+    if (Off::UStruct::ChildProperties >= 0) {
         uintptr_t cur = 0;
         guard.Try([&] {
             auto v = SafeMemory::SafeReadAny<uintptr_t>(
@@ -993,9 +1458,7 @@ INTERNAL std::vector<PropertyInfo> CollectStructProperties(
                 std::string propName;
                 PropertyInfo p;
                 guard.Try([&] {
-                    auto nm  = SafeMemory::SafeReadAny<int32_t>(
-                            cur + Off::UObject::NamePrivate);
-                    if (nm) propName = UE::NameArray::GetName(*nm);
+                    propName = ReadObjectName(cur);
                     auto off = SafeMemory::SafeReadAny<int32_t>(cur + Off::UProperty::Offset_Internal);
                     auto sz  = SafeMemory::SafeReadAny<int32_t>(cur + Off::UProperty::ElementSize);
                     auto dim = SafeMemory::SafeReadAny<int32_t>(cur + Off::UProperty::ArrayDim);
@@ -1065,7 +1528,8 @@ INTERNAL int32_t ExpectedCppSizeForType(const std::string& typeName) noexcept {
     // Core containers and helper structs the dumper emits verbatim.
     if (t == "FName" || t == "FWeakObjectPtr") return 8;
     if (t.rfind("TWeakObjectPtr<", 0) == 0) return 8;
-    if (t.rfind("TLazyObjectPtr<", 0) == 0) return 8;
+    if (t.rfind("TLazyObjectPtr<", 0) == 0) return g_detectedSizes.lazyObjectPtr;
+    if (t == "FFieldPath") return g_detectedSizes.fieldPath;
 
     if (t == "FString" || t == "FScriptInterface") return 16;
     if (t == "FScriptDelegate") return g_detectedSizes.scriptDelegate;
@@ -1082,6 +1546,9 @@ INTERNAL int32_t ExpectedCppSizeForType(const std::string& typeName) noexcept {
     if (t == "FSoftObjectPtr") return g_detectedSizes.softObjectPtr;
     if (t.rfind("TSoftObjectPtr<", 0) == 0) return g_detectedSizes.softObjectPtr;
     if (t.rfind("TSoftClassPtr<", 0) == 0)  return g_detectedSizes.softObjectPtr;
+    if (t == "FAssetPtr") return g_detectedSizes.assetPtr;
+    if (t.rfind("TAssetPtr<", 0) == 0) return g_detectedSizes.assetPtr;
+    if (t.rfind("TAssetSubclassOf<", 0) == 0) return g_detectedSizes.assetPtr;
 
     if (t.rfind("TSet<", 0) == 0) return g_detectedSizes.set;
     if (t.rfind("TMap<", 0) == 0) return g_detectedSizes.map;
@@ -1102,10 +1569,15 @@ INTERNAL bool IsTypeSizeMismatch(const std::string& typeName,
 
 // Generates struct/class fields with padding.
 // Emits bool properties as bitfields to preserve layout and allow direct access.
+// A member EmitFields wrote as a real C++ member (not a bit-field, not a
+// comment): its name and engine offset, for the layout asserts.
+using PlacedMembers = std::vector<std::pair<std::string, int32_t>>;
+
 INTERNAL void EmitFields(std::ofstream& f,
                          const std::vector<PropertyInfo>& props,
                          int32_t baseSize,
-                         int32_t totalSize) noexcept {
+                         int32_t totalSize,
+                         PlacedMembers* placed = nullptr) noexcept {
     int32_t cursor = baseSize;
     std::unordered_map<std::string, int32_t> totalByName;
     std::unordered_map<std::string, int32_t> nextByName;
@@ -1158,17 +1630,7 @@ INTERNAL void EmitFields(std::ofstream& f,
                 cursor = byteOffset;
             }
 
-            while (i < props.size() &&
-                   props[i].isBitfield &&
-                   props[i].offset == byteOffset) {
-                const auto& bp = props[i];
-                std::string name = emitName(bp);
-                f << "    uint8_t " << name
-                  << " : 1;  // 0x" << std::hex << std::uppercase
-                  << bp.offset << " (mask=0x" << (int)bp.boolMask
-                  << ", size=0x1)" << std::dec << "\n";
-                ++i;
-            }
+            EmitBitfieldByte(f, props, i, emitName);
             cursor = byteOffset + 1;
             continue;
         }
@@ -1207,6 +1669,7 @@ INTERNAL void EmitFields(std::ofstream& f,
         }
 
         std::string name = emitName(p);
+        if (placed) placed->emplace_back(name, p.offset);
         const bool sizeMismatch =
                 p.arrayDim <= 1 && IsTypeSizeMismatch(p.typeName, p.elementSize);
         // Property metadata: show replication/config/save flags as short tags
@@ -1236,6 +1699,54 @@ INTERNAL void EmitFields(std::ofstream& f,
         f << "    uint8_t Pad_" << std::hex << std::uppercase << cursor
           << "[0x" << (totalSize - cursor) << "];  // tail" << std::dec << "\n";
     }
+}
+
+// static_asserts that make the compiler check the emitted layout against the
+// engine's: each member offset, and the size. A struct must be exactly its
+// properties size rounded up to the minimum alignment (what
+// UScriptStruct::GetStructureSize gives; arrays of it step by that). A class
+// must be its properties size rounded up to its own C++ alignment, i.e. hold
+// the properties and nothing after them but alignment padding: the engine
+// allocates objects by its own size, and the engine's class alignment does
+// not always equal the C++ one (4.26 Blueprint classes reporting 16 while the
+// C++ class is 8-aligned: ShooterHudBP_C, the chest AnimBPs; 4.17 dino
+// Blueprints reporting 8 under a 16-aligned native parent: Dino_Character_BP_C).
+INTERNAL void EmitLayoutAsserts(std::ofstream& f,
+                                const std::string& typeName,
+                                int32_t propertiesSize,
+                                int32_t minAlignment,
+                                bool exactSize,
+                                const PlacedMembers& placed) noexcept {
+    if (propertiesSize > 0) {
+        const int32_t align = minAlignment > 0 ? minAlignment : 1;
+        const int32_t size = (propertiesSize + align - 1) / align * align;
+        f << std::hex << std::uppercase;
+        if (exactSize) {
+            f << "static_assert(sizeof(" << typeName << ") == 0x" << size;
+        } else {
+            f << "static_assert(sizeof(" << typeName << ") == (0x" << propertiesSize
+              << " + alignof(" << typeName << ") - 1) / alignof(" << typeName
+              << ") * alignof(" << typeName << ")";
+        }
+        f << std::dec << ", \"Wrong size on " << typeName << "\");\n";
+    }
+    for (const auto& [name, offset] : placed) {
+        f << "static_assert(offsetof(" << typeName << ", " << name << ") == 0x"
+          << std::hex << std::uppercase << offset << std::dec << ", \"Member '"
+          << typeName << "::" << name << "' has a wrong offset!\");\n";
+    }
+}
+
+// offsetof on a class with bases is "conditionally supported" (clang warns);
+// clang and GCC compute it right for the single, non-virtual inheritance the
+// SDK uses, so the generated headers silence that one warning.
+INTERNAL void OpenOffsetofScope(std::ofstream& f) noexcept {
+    f << "\n#pragma GCC diagnostic push\n";
+    f << "#pragma GCC diagnostic ignored \"-Winvalid-offsetof\"\n";
+}
+
+INTERNAL void CloseOffsetofScope(std::ofstream& f) noexcept {
+    f << "\n#pragma GCC diagnostic pop\n";
 }
 
 INTERNAL std::string SignatureType(const PropertyInfo& p, bool asReturn) noexcept {
@@ -1297,7 +1808,12 @@ INTERNAL FunctionInfo BuildFunctionInfo(
         if (flags) fn.functionFlags = *flags;
         if (num) fn.numParms = *num;
         if (sz && *sz >= 0 && *sz <= 0x10000) fn.paramsSize = *sz;
-        if (func && *func != 0) fn.nativeFuncPtr = *func;
+        // UFunction::Func is the function's own exec thunk only when it is
+        // native. Every script function shares one interpreter entry there
+        // (UObject::ProcessInternal), which is not an address of the function.
+        if (func && *func != 0 && (fn.functionFlags & FUNC_Native) != 0) {
+            fn.nativeFuncPtr = *func;
+        }
     });
 
     std::vector<PropertyInfo> props =
@@ -1371,6 +1887,18 @@ INTERNAL std::vector<FunctionInfo> CollectStructFunctions(
             if (v) next = *v;
         });
         cur = next;
+    }
+
+    // Two functions of one class can end up with the same C++ identifier
+    // (names that differ only in characters SanitizeIdent replaces). Each keeps
+    // its own rawName for the lookup; the later one gets a numbered identifier.
+    std::unordered_set<std::string> usedNames;
+    for (auto& fn : funcs) {
+        std::string unique = fn.name;
+        for (int32_t n = 1; !usedNames.insert(unique).second; ++n) {
+            unique = fn.name + "_" + std::to_string(n);
+        }
+        fn.name = unique;
     }
     return funcs;
 }
@@ -1488,8 +2016,13 @@ INTERNAL void EmitFunctionImpl(std::ofstream& f,
                 f << "    Parms." << p.name << " = " << p.name << ";\n";
             }
         }
-        f << "    auto Flgs = Func->FunctionFlags;\n";
-        f << "    Func->FunctionFlags |= (EFunctionFlags)0x400;\n";
+        // Like Dumper-7: only a native function gets FUNC_Native set around
+        // the call; a Blueprint function goes through ProcessEvent unchanged.
+        const bool nativeFn = (fn.functionFlags & FUNC_Native) != 0;
+        if (nativeFn) {
+            f << "    auto Flgs = Func->FunctionFlags;\n";
+            f << "    Func->FunctionFlags |= (EFunctionFlags)0x400;\n";
+        }
         // Direct native call when enabled and function has a native impl
         if (SDKDumper::g_useDirectCalls && fn.nativeFuncPtr != 0) {
             f << "    // Direct native call (offset 0x" << std::hex << std::uppercase
@@ -1499,7 +2032,7 @@ INTERNAL void EmitFunctionImpl(std::ofstream& f,
         } else {
             f << "    __CDO->ProcessEvent(Func, " << (hasFrame ? "&Parms" : "nullptr") << ");\n";
         }
-        f << "    Func->FunctionFlags = Flgs;\n";
+        if (nativeFn) f << "    Func->FunctionFlags = Flgs;\n";
         for (const auto& p : fn.params) {
             if (p.name.empty()) continue;
             if ((p.propertyFlags & CPF_OutParm) == 0) continue;
@@ -1553,8 +2086,13 @@ INTERNAL void EmitFunctionImpl(std::ofstream& f,
                 f << "    Parms." << p.name << " = " << p.name << ";\n";
             }
         }
-        f << "    auto Flgs = Func->FunctionFlags;\n";
-        f << "    Func->FunctionFlags |= (EFunctionFlags)0x400;\n";
+        // Like Dumper-7: only a native function gets FUNC_Native set around
+        // the call; a Blueprint function goes through ProcessEvent unchanged.
+        const bool nativeFn = (fn.functionFlags & FUNC_Native) != 0;
+        if (nativeFn) {
+            f << "    auto Flgs = Func->FunctionFlags;\n";
+            f << "    Func->FunctionFlags |= (EFunctionFlags)0x400;\n";
+        }
         // Direct native call when enabled and function has a native impl
         if (SDKDumper::g_useDirectCalls && fn.nativeFuncPtr != 0) {
             f << "    // Direct native call (offset 0x" << std::hex << std::uppercase
@@ -1564,7 +2102,7 @@ INTERNAL void EmitFunctionImpl(std::ofstream& f,
         } else {
             f << "    ProcessEvent(Func, " << (hasFrame ? "&Parms" : "nullptr") << ");\n";
         }
-        f << "    Func->FunctionFlags = Flgs;\n";
+        if (nativeFn) f << "    Func->FunctionFlags = Flgs;\n";
         for (const auto& p : fn.params) {
             if (p.name.empty()) continue;
             if ((p.propertyFlags & CPF_OutParm) == 0) continue;
@@ -2711,12 +3249,10 @@ INTERNAL bool ReadEnumCandidate(uintptr_t arrayAddr,
     guard.Try([&] {
         for (int32_t i = 0; i < h.num; ++i) {
             uintptr_t entry = h.data + static_cast<uintptr_t>(i) * entryStride;
-            auto comp = SafeMemory::SafeReadAny<int32_t>(entry);
-            auto val  = SafeMemory::SafeReadAny<int64_t>(entry + valueOffset);
-            if (!comp || !val) return;
-            if (*comp < 0 || *comp > 0x40000000) return;
+            auto val = SafeMemory::SafeReadAny<int64_t>(entry + valueOffset);
+            if (!val) return;
 
-            std::string raw = UE::NameArray::GetName(*comp);
+            std::string raw = ReadFNameAt(entry);
             if (!IsPlausibleEnumRawName(raw)) return;
 
             EnumEntry e;
@@ -2859,7 +3395,7 @@ INTERNAL int64_t MaskEnumValueToFit(int64_t value, int32_t sizeBytes) noexcept {
 INTERNAL void EmitEnum(std::ofstream& f, const ObjMeta& meta) noexcept {
     std::vector<EnumEntry> entries = ReadEnumEntries(meta.address);
     const int32_t sizeHint = EnumSizeHintFor(meta.address);
-    f << "enum class E" << SanitizeIdent(meta.name)
+    f << "enum class " << CppNameOf(meta)
       << " : " << EnumUnderlyingType(entries, sizeHint) << " {\n";
 
     if (entries.empty()) {
@@ -2908,13 +3444,24 @@ INTERNAL bool WriteBasicHpp(const std::string& outDir) noexcept {
     if (!f) return false;
     f << "// Auto-generated by Dumper-7 [Android]. Core SDK support types.\n";
     f << "#pragma once\n\n";
+    f << "#include <atomic>\n";
     f << "#include <cstdint>\n";
     f << "#include <cstddef>\n";
     f << "#include <cstring>\n";
+    f << "#include <dlfcn.h>\n";
     f << "#include <stdexcept>\n";
     f << "#include <string>\n";
     f << "#include <type_traits>\n";
     f << "#include <vector>\n\n";
+    f << R"SDK(// dl_iterate_phdr, declared here instead of including <link.h>: that header
+// brings in <elf.h>, and its macros (EM_MAX, PT_LOAD, ...) replace enum values
+// the engine reflects under the same names.
+extern "C" {
+struct dl_phdr_info;
+int dl_iterate_phdr(int (*)(struct dl_phdr_info*, size_t, void*), void*);
+}
+
+)SDK";
     f << "namespace SDK {\n\n";
     f << "using int8   = std::int8_t;\n";
     f << "using int16  = std::int16_t;\n";
@@ -2925,9 +3472,33 @@ INTERNAL bool WriteBasicHpp(const std::string& outDir) noexcept {
     f << "using uint32 = std::uint32_t;\n";
     f << "using uint64 = std::uint64_t;\n";
     f << "using TCHAR  = char16_t;\n\n";
+    // File name of the engine library, for finding it again in another process.
+    std::string libName = Off::Discovery::LibPath;
+    const size_t slash = libName.find_last_of('/');
+    if (slash != std::string::npos) libName.erase(0, slash + 1);
+
+    // FMemory::Free, when the library still has the symbol. It is how storage
+    // the engine allocated into a TArray/FString is given back (EngineFree).
+    uintptr_t memoryFree = 0;
+    {
+        const UE4Info info = BuildCurrentUE4Info();
+        if (void* sym = FindExactSymbolAny(info, "_ZN7FMemory4FreeEPv")) {
+            const uintptr_t addr = reinterpret_cast<uintptr_t>(sym);
+            if (IsExecutableSymbolAddress(addr)) memoryFree = OffsetFromLibBase(addr);
+        }
+        DLOGI("[sdk][basic] FMemory::Free offset=%s", HexPtr(memoryFree).c_str());
+    }
+
     f << "struct SDKOffsets {\n";
+    f << "    // Where the library was loaded when the dump ran. Another run of the\n";
+    f << "    // game loads it elsewhere: use SDK::GLibBase, which InitSDK sets.\n";
     f << "    static constexpr std::uintptr_t LibBase = "
       << HexPtr(CurrentLibBase()) << ";\n";
+    f << "    static constexpr const char* LibName = "
+      << CppStringLiteral(libName) << ";\n";
+    f << "    // FMemory::Free(void*), 0 when the library has no symbol for it.\n";
+    f << "    static constexpr std::uintptr_t FMemoryFree = "
+      << HexPtr(memoryFree) << ";\n";
     f << "    static constexpr const char* EngineVersion = "
       << CppStringLiteral(EngineVersionString()) << ";\n";
     f << "    static constexpr int32 EngineMajor = "
@@ -2990,6 +3561,33 @@ INTERNAL bool WriteBasicHpp(const std::string& outDir) noexcept {
     f << "    static constexpr int32 GObjectsObjObjectsOffset = "
       << Off::InSDK::GObjectsObjObjectsOffset << ";\n";
     f << "};\n\n";
+f << R"SDK(// Base of the engine library in this process; InitSDK sets it.
+inline std::uintptr_t GLibBase = 0;
+
+// FMemory::Free, for storage the engine allocated into a TArray or FString it
+// handed back (a by-value result, an out parameter). Those types have no
+// destructor, because the same types are also views of memory the engine or the
+// caller owns, so giving storage back is explicit: TArray::FreeEngineData().
+// When the function cannot be found the block is leaked; it is never passed to
+// another allocator.
+inline void EngineFree(void* Memory) {
+    using FreeFn = void (*)(void*);
+    static std::atomic<FreeFn> Resolved{nullptr};
+    if (!Memory) return;
+    FreeFn Release = Resolved.load(std::memory_order_acquire);
+    if (!Release) {
+        if (SDKOffsets::FMemoryFree != 0 && SDK::GLibBase != 0) {
+            Release = reinterpret_cast<FreeFn>(SDK::GLibBase + SDKOffsets::FMemoryFree);
+        } else if (void* Library = dlopen(SDKOffsets::LibName, RTLD_NOW | RTLD_NOLOAD)) {
+            Release = reinterpret_cast<FreeFn>(dlsym(Library, "_ZN7FMemory4FreeEPv"));
+            dlclose(Library);
+        }
+        if (Release) Resolved.store(Release, std::memory_order_release);
+    }
+    if (Release) Release(Memory);
+}
+
+)SDK";
     f << "inline void* GNames = nullptr;\n";
     f << "inline void* GWorld = nullptr;\n";
     f << "using ProcessEventFn = void(*)(class UObject*, class UFunction*, void*);\n";
@@ -3159,6 +3757,7 @@ INTERNAL bool WriteBasicHpp(const std::string& outDir) noexcept {
           << Off::InSDK::GObjectsObjObjectsOffset << std::dec << "] = {};\n";
         f << "    " << innerType << " ObjObjects;\n";
         f << "    int32 Num() const { return ObjObjects.Num(); }\n";
+        f << "    FUObjectItem* GetItemByIndex(int32 Index) const { return ObjObjects.GetItemByIndex(Index); }\n";
         f << "    class UObject* GetByIndex(int32 Index) const { return ObjObjects.GetByIndex(Index); }\n";
         f << "    auto begin() const { return ObjObjects.begin(); }\n";
         f << "    auto end() const { return ObjObjects.end(); }\n";
@@ -3398,14 +3997,43 @@ INTERNAL bool WriteBasicHpp(const std::string& outDir) noexcept {
     f << "    SDK::GWorld = reinterpret_cast<void*>(InGWorld);\n";
     f << "    SDK::ProcessEvent = reinterpret_cast<ProcessEventFn>(InProcessEvent);\n";
     f << "}\n\n";
-    f << "inline void InitSDK(std::uintptr_t LibBase) {\n";
-    f << "    InitSDKFromAbsolute(\n";
-    f << "        SDKOffsets::GObjects ? LibBase + SDKOffsets::GObjects : 0,\n";
-    f << "        SDKOffsets::GNames ? LibBase + SDKOffsets::GNames : 0,\n";
-    f << "        SDKOffsets::GWorld ? LibBase + SDKOffsets::GWorld : 0,\n";
-    f << "        SDKOffsets::ProcessEvent ? LibBase + SDKOffsets::ProcessEvent : 0);\n";
-    f << "}\n\n";
-    f << "inline void InitSDK() { InitSDK(SDKOffsets::LibBase); }\n\n";
+f << R"SDK(inline void InitSDK(std::uintptr_t LibBase) {
+    SDK::GLibBase = LibBase;
+    InitSDKFromAbsolute(
+        SDKOffsets::GObjects ? LibBase + SDKOffsets::GObjects : 0,
+        SDKOffsets::GNames ? LibBase + SDKOffsets::GNames : 0,
+        SDKOffsets::GWorld ? LibBase + SDKOffsets::GWorld : 0,
+        SDKOffsets::ProcessEvent ? LibBase + SDKOffsets::ProcessEvent : 0);
+}
+
+// Base of the engine library (SDKOffsets::LibName) in this process, 0 when it
+// is not loaded.
+inline std::uintptr_t FindLibBase() {
+    // The first two members of dl_phdr_info, the same on every Linux and
+    // Android ABI: where the library is loaded, then its path.
+    struct FLoadedLibrary { std::uintptr_t Base; const char* Path; };
+    std::uintptr_t Base = 0;
+    dl_iterate_phdr([](dl_phdr_info* Info, size_t, void* Data) -> int {
+        const auto* Library = reinterpret_cast<const FLoadedLibrary*>(Info);
+        if (!Library->Path) return 0;
+        const char* Slash = std::strrchr(Library->Path, '/');
+        if (std::strcmp(Slash ? Slash + 1 : Library->Path, SDKOffsets::LibName) != 0) return 0;
+        *static_cast<std::uintptr_t*>(Data) = Library->Base;
+        return 1;
+    }, &Base);
+    return Base;
+}
+
+// Finds the engine library in this process and initialises from it. False when
+// the library is not loaded yet.
+inline bool InitSDK() {
+    const std::uintptr_t Base = FindLibBase();
+    if (!Base) return false;
+    InitSDK(Base);
+    return true;
+}
+
+)SDK";
     f << "}  // namespace SDK\n";
     return true;
 }
@@ -3431,6 +4059,34 @@ INTERNAL CoreMathSizes DetectCoreMathSizes(
     return s;
 }
 
+INTERNAL std::string Hex32(int32_t v) noexcept;
+
+// Sizes of the engine's helper types where their layout is known (UE4.20 to
+// UE5.0, arm64). A typed definition is written only when this game reports
+// exactly that size. Any other size means the engine changed the type, and it
+// is written as an opaque block of the reported size instead, so member
+// offsets stay right on engines this file knows nothing about.
+namespace KnownSize {
+    constexpr int32_t Text              = 0x18;  // TSharedRef<ITextData> + uint32 Flags
+    constexpr int32_t SoftObjectPath    = 0x18;  // FName AssetPathName + FString SubPathString
+    constexpr int32_t SoftObjectPtr     = 0x28;  // FWeakObjectPtr + int32 tag + FSoftObjectPath
+    constexpr int32_t AssetPtr          = 0x20;  // FWeakObjectPtr + int32 tag + FStringAssetReference (4.17)
+    constexpr int32_t LazyObjectPtr     = 0x1C;  // FWeakObjectPtr + int32 tag + FGuid
+    constexpr int32_t FieldPath         = 0x20;  // FField* + TWeakObjectPtr<UStruct> + TArray<FName>
+    constexpr int32_t ScriptDelegate    = 0x10;  // FWeakObjectPtr + FName
+    constexpr int32_t MulticastDelegate = 0x10;  // TArray<FScriptDelegate>
+    constexpr int32_t Set               = 0x50;  // TSparseArray (0x38) + inline hash (0x10) + int32 HashSize
+}
+
+// A helper type whose layout is not known on this engine: a block of its size.
+INTERNAL void EmitOpaqueType(std::ofstream& f, const char* name, int32_t size) noexcept {
+    f << "// Layout not known on this engine; only the size (" << Hex32(size)
+      << ") is.\n";
+    f << "struct " << name << " { uint8 Data[" << Hex32(size) << "]{}; };\n";
+    f << "static_assert(sizeof(" << name << ") == " << Hex32(size) << ", \""
+      << name << " size mismatch\");\n\n";
+}
+
 INTERNAL bool WriteContainersHpp(const std::string& outDir,
                                  const CoreMathSizes& mathSizes) noexcept {
     std::ofstream f(outDir + "/Containers.hpp");
@@ -3440,19 +4096,40 @@ INTERNAL bool WriteContainersHpp(const std::string& outDir,
     // values for the current game during emission. Property-detected values
     // (from TextProperty/SoftObjectProperty elementSize) take priority.
     if (g_detectedSizes.text <= 0) {
-        g_detectedSizes.text = mathSizes.text > 0 ? mathSizes.text : 0x18;
+        g_detectedSizes.text = mathSizes.text > 0 ? mathSizes.text : KnownSize::Text;
     }
     if (g_detectedSizes.softObjectPath <= 0) {
-        g_detectedSizes.softObjectPath = mathSizes.softObjectPath > 0 ? mathSizes.softObjectPath : 0x18;
+        g_detectedSizes.softObjectPath =
+                mathSizes.softObjectPath > 0 ? mathSizes.softObjectPath : KnownSize::SoftObjectPath;
     }
     if (g_detectedSizes.softObjectPtr <= 0) {
-        g_detectedSizes.softObjectPtr = mathSizes.softObjectPath > 0 ? (mathSizes.softObjectPath + 0x10) : 0x28;
+        g_detectedSizes.softObjectPtr = g_detectedSizes.softObjectPath + 0x10;
     }
-    if (g_detectedSizes.scriptDelegate <= 0) g_detectedSizes.scriptDelegate = 0x10;
-    if (g_detectedSizes.multicastScriptDelegate <= 0) g_detectedSizes.multicastScriptDelegate = 0x10;
+    if (g_detectedSizes.assetPtr <= 0) g_detectedSizes.assetPtr = KnownSize::AssetPtr;
+    if (g_detectedSizes.lazyObjectPtr <= 0) g_detectedSizes.lazyObjectPtr = KnownSize::LazyObjectPtr;
+    if (g_detectedSizes.fieldPath <= 0) g_detectedSizes.fieldPath = KnownSize::FieldPath;
+    if (g_detectedSizes.scriptDelegate <= 0) g_detectedSizes.scriptDelegate = KnownSize::ScriptDelegate;
+    if (g_detectedSizes.multicastScriptDelegate <= 0) {
+        g_detectedSizes.multicastScriptDelegate = KnownSize::MulticastDelegate;
+    }
     if (g_detectedSizes.multicastSparseDelegate <= 0) g_detectedSizes.multicastSparseDelegate = 0x1;
-    if (g_detectedSizes.set <= 0) g_detectedSizes.set = 0x50;
-    if (g_detectedSizes.map <= 0) g_detectedSizes.map = 0x50;
+    if (g_detectedSizes.set <= 0) g_detectedSizes.set = KnownSize::Set;
+    if (g_detectedSizes.map <= 0) g_detectedSizes.map = KnownSize::Set;
+
+    const bool typedSets      = g_detectedSizes.set == KnownSize::Set &&
+                                g_detectedSizes.map == KnownSize::Set;
+    const bool typedText      = g_detectedSizes.text == KnownSize::Text;
+    const bool typedLazy      = g_detectedSizes.lazyObjectPtr == KnownSize::LazyObjectPtr;
+    const bool typedDelegate  = g_detectedSizes.scriptDelegate == KnownSize::ScriptDelegate;
+    const bool typedMulticast = typedDelegate &&
+            g_detectedSizes.multicastScriptDelegate == KnownSize::MulticastDelegate;
+    const bool typedSoft      = g_detectedSizes.softObjectPtr == KnownSize::SoftObjectPtr &&
+                                g_detectedSizes.softObjectPath == KnownSize::SoftObjectPath;
+    const bool typedFieldPath = g_detectedSizes.fieldPath == KnownSize::FieldPath;
+    const bool typedAsset     = g_detectedSizes.assetPtr == KnownSize::AssetPtr;
+    DLOGI("[sdk][containers] typed: sets=%d text=%d lazy=%d delegate=%d multicast=%d soft=%d fieldPath=%d asset=%d",
+          (int)typedSets, (int)typedText, (int)typedLazy, (int)typedDelegate,
+          (int)typedMulticast, (int)typedSoft, (int)typedFieldPath, (int)typedAsset);
 
     f << "// Auto-generated by Dumper-7 [Android]. Containers and common UE structs.\n";
     f << "#pragma once\n\n";
@@ -3460,125 +4137,434 @@ INTERNAL bool WriteContainersHpp(const std::string& outDir,
     f << "#include <cmath>\n";
     f << "#include <initializer_list>\n\n";
     f << "namespace SDK {\n\n";
-    f << "template<class T>\n";
-    f << "struct TArray {\n";
-    f << "    T* Data = nullptr;\n";
-    f << "    int32 Num = 0;\n";
-    f << "    int32 Max = 0;\n\n";
-    f << "    constexpr TArray() = default;\n";
-    f << "    constexpr TArray(T* InData, int32 InNum) : Data(InData), Num(InNum), Max(InNum) {}\n";
-    f << "    constexpr int32 Count() const { return Num; }\n";
-    f << "    constexpr int32 size() const { return Num; }\n";
-    f << "    constexpr int32 NumElements() const { return Num; }\n";
-    f << "    constexpr int32 MaxElements() const { return Max; }\n";
-    f << "    constexpr bool IsEmpty() const { return Num <= 0; }\n";
-    f << "    constexpr bool empty() const { return IsEmpty(); }\n";
-    f << "    constexpr bool IsValid() const { return Data != nullptr && Num >= 0 && Max >= Num; }\n";
-    f << "    constexpr bool IsValidIndex(int32 Index) const { return Index >= 0 && Index < Num; }\n";
-    f << "    T* GetData() { return Data; }\n";
-    f << "    const T* GetData() const { return Data; }\n";
-    f << "    T& At(int32 Index) { return (*this)[Index]; }\n";
-    f << "    const T& At(int32 Index) const { return (*this)[Index]; }\n";
-    f << "    T& operator[](int32 Index) { if (!IsValidIndex(Index)) throw std::out_of_range(\"TArray index\"); return Data[Index]; }\n";
-    f << "    const T& operator[](int32 Index) const { if (!IsValidIndex(Index)) throw std::out_of_range(\"TArray index\"); return Data[Index]; }\n";
-    f << "    T& Front() { return (*this)[0]; }\n";
-    f << "    const T& Front() const { return (*this)[0]; }\n";
-    f << "    T& Back() { return (*this)[Num - 1]; }\n";
-    f << "    const T& Back() const { return (*this)[Num - 1]; }\n";
-    f << "    int32 Find(const T& Value) const { for (int32 i = 0; i < Num; ++i) if (Data[i] == Value) return i; return -1; }\n";
-    f << "    bool Contains(const T& Value) const { return Find(Value) >= 0; }\n";
-    f << "    template<class Fn> void ForEach(Fn FnValue) { for (int32 i = 0; i < Num; ++i) FnValue(Data[i]); }\n";
-    f << "    template<class Fn> void ForEach(Fn FnValue) const { for (int32 i = 0; i < Num; ++i) FnValue(Data[i]); }\n";
-    f << "    T* begin() { return Data; }\n";
-    f << "    T* end() { return Data ? Data + Num : nullptr; }\n";
-    f << "    const T* begin() const { return Data; }\n";
-    f << "    const T* end() const { return Data ? Data + Num : nullptr; }\n";
-    f << "};\n";
-    f << "static_assert(sizeof(TArray<uint8>) == 0x10, \"TArray layout must stay 16 bytes\");\n\n";
-    f << "template<class K, class V>\n";
-    f << "struct TPair {\n";
-    f << "    K Key;\n";
-    f << "    V Value;\n";
-    f << "};\n\n";
-    f << "template<class T>\n";
-    f << "struct TSet {\n";
-    f << "    uint8 Data[0x" << std::hex << std::uppercase
-      << g_detectedSizes.set << std::dec << "]{};\n";
-    f << "    static constexpr int32 InlineSize = 0x" << std::hex << std::uppercase
-      << g_detectedSizes.set << std::dec << ";\n";
-    f << "    constexpr int32 RawSize() const { return InlineSize; }\n";
-    f << "    constexpr bool IsOpaque() const { return true; }\n";
-    f << "    constexpr bool IsValid() const { return true; }\n";
-    f << "    uint8* GetRawData() { return Data; }\n";
-    f << "    const uint8* GetRawData() const { return Data; }\n";
-    f << "    uint8* begin() { return Data; }\n";
-    f << "    uint8* end() { return Data + InlineSize; }\n";
-    f << "    const uint8* begin() const { return Data; }\n";
-    f << "    const uint8* end() const { return Data + InlineSize; }\n";
-    f << "};\n";
-    f << "static_assert(sizeof(TSet<uint8>) == 0x" << std::hex << std::uppercase
-      << g_detectedSizes.set << std::dec << ", \"TSet opaque layout size mismatch\");\n\n";
-    f << "template<class K, class V>\n";
-    f << "struct TMap {\n";
-    f << "    uint8 Data[0x" << std::hex << std::uppercase
-      << g_detectedSizes.map << std::dec << "]{};\n";
-    f << "    static constexpr int32 InlineSize = 0x" << std::hex << std::uppercase
-      << g_detectedSizes.map << std::dec << ";\n";
-    f << "    constexpr int32 RawSize() const { return InlineSize; }\n";
-    f << "    constexpr bool IsOpaque() const { return true; }\n";
-    f << "    constexpr bool IsValid() const { return true; }\n";
-    f << "    uint8* GetRawData() { return Data; }\n";
-    f << "    const uint8* GetRawData() const { return Data; }\n";
-    f << "    uint8* begin() { return Data; }\n";
-    f << "    uint8* end() { return Data + InlineSize; }\n";
-    f << "    const uint8* begin() const { return Data; }\n";
-    f << "    const uint8* end() const { return Data + InlineSize; }\n";
-    f << "};\n";
-    f << "static_assert(sizeof(TMap<uint8, uint8>) == 0x" << std::hex << std::uppercase
-      << g_detectedSizes.map << std::dec << ", \"TMap opaque layout size mismatch\");\n\n";
-    f << "struct FString : public TArray<TCHAR> {\n";
-    f << "    using TArray<TCHAR>::TArray;\n";
-    f << "    const TCHAR* CStr() const { return Data ? Data : u\"\"; }\n";
-    f << "};\n";
-    f << "static_assert(sizeof(FString) == 0x10, \"FString layout must stay 16 bytes\");\n\n";
-    // FText — size varies across UE versions. Use game-detected size.
-    f << "struct FText { uint8 Data[0x" << std::hex << std::uppercase
-      << g_detectedSizes.text << std::dec << "]{}; };\n\n";
-    f << "struct FWeakObjectPtr {\n";
-    f << "    int32 ObjectIndex = 0;\n";
-    f << "    int32 ObjectSerialNumber = 0;\n";
-    f << "};\n\n";
-    f << "template<class T> struct TWeakObjectPtr : public FWeakObjectPtr { using ElementType = T; };\n";
-    f << "template<class T> struct TLazyObjectPtr : public FWeakObjectPtr { using ElementType = T; };\n\n";
-    // Keep reflected math/core structs out of here. Only opaque runtime helper
-    // types are emitted, and their sizes come from this game's property data.
-    f << "template<class T>\n";
-    f << "struct TSubclassOf {\n";
-    f << "    class UClass* Class = nullptr;\n";
-    f << "    constexpr TSubclassOf() = default;\n";
-    f << "    constexpr TSubclassOf(class UClass* InClass) : Class(InClass) {}\n";
-    f << "    constexpr operator class UClass*() const { return Class; }\n";
-    f << "    constexpr class UClass* operator->() const { return Class; }\n";
-    f << "    constexpr bool operator==(const TSubclassOf& Other) const { return Class == Other.Class; }\n";
-    f << "    constexpr bool operator!=(const TSubclassOf& Other) const { return Class != Other.Class; }\n";
-    f << "};\n\n";
-    f << "struct FScriptInterface {\n";
-    f << "    class UObject* ObjectPointer = nullptr;\n";
-    f << "    void* InterfacePointer = nullptr;\n";
-    f << "};\n";
-    f << "static_assert(sizeof(FScriptInterface) == 0x10, \"FScriptInterface layout must stay 16 bytes\");\n";
-    f << "template<class T>\n";
-    f << "struct TScriptInterface : public FScriptInterface { using InterfaceType = T; };\n\n";
-    f << "struct FScriptDelegate { uint8 Data[0x" << std::hex << std::uppercase
-      << g_detectedSizes.scriptDelegate << std::dec << "]{}; };\n";
-    f << "struct FMulticastScriptDelegate { uint8 Data[0x" << std::hex << std::uppercase
-      << g_detectedSizes.multicastScriptDelegate << std::dec << "]{}; };\n";
-    f << "struct FMulticastSparseDelegate { uint8 Data[0x" << std::hex << std::uppercase
-      << g_detectedSizes.multicastSparseDelegate << std::dec << "]{}; };\n\n";
-    f << "struct FSoftObjectPtr { uint8 Data[0x" << std::hex << std::uppercase
-      << g_detectedSizes.softObjectPtr << std::dec << "]{}; };\n";
-    f << "template<class T> struct TSoftObjectPtr : public FSoftObjectPtr {};\n";
-    f << "template<class T> struct TSoftClassPtr : public FSoftObjectPtr {};\n\n";
+    f << R"SDK(template<class T>
+struct TArray {
+    T* Data = nullptr;
+    int32 Num = 0;
+    int32 Max = 0;
+
+    constexpr TArray() = default;
+    constexpr TArray(T* InData, int32 InNum) : Data(InData), Num(InNum), Max(InNum) {}
+    constexpr int32 Count() const { return Num; }
+    constexpr int32 size() const { return Num; }
+    constexpr int32 NumElements() const { return Num; }
+    constexpr int32 MaxElements() const { return Max; }
+    constexpr bool IsEmpty() const { return Num <= 0; }
+    constexpr bool empty() const { return IsEmpty(); }
+    constexpr bool IsValid() const { return Data != nullptr && Num >= 0 && Max >= Num; }
+    constexpr bool IsValidIndex(int32 Index) const { return Index >= 0 && Index < Num; }
+    T* GetData() { return Data; }
+    const T* GetData() const { return Data; }
+    T& At(int32 Index) { return (*this)[Index]; }
+    const T& At(int32 Index) const { return (*this)[Index]; }
+    T& operator[](int32 Index) { if (!IsValidIndex(Index)) throw std::out_of_range("TArray index"); return Data[Index]; }
+    const T& operator[](int32 Index) const { if (!IsValidIndex(Index)) throw std::out_of_range("TArray index"); return Data[Index]; }
+    T& Front() { return (*this)[0]; }
+    const T& Front() const { return (*this)[0]; }
+    T& Back() { return (*this)[Num - 1]; }
+    const T& Back() const { return (*this)[Num - 1]; }
+    int32 Find(const T& Value) const { for (int32 i = 0; i < Num; ++i) if (Data[i] == Value) return i; return -1; }
+    bool Contains(const T& Value) const { return Find(Value) >= 0; }
+    template<class Fn> void ForEach(Fn FnValue) { for (int32 i = 0; i < Num; ++i) FnValue(Data[i]); }
+    template<class Fn> void ForEach(Fn FnValue) const { for (int32 i = 0; i < Num; ++i) FnValue(Data[i]); }
+    T* begin() { return Data; }
+    T* end() { return Data ? Data + Num : nullptr; }
+    const T* begin() const { return Data; }
+    const T* end() const { return Data ? Data + Num : nullptr; }
+
+    // Gives storage the engine allocated back to it (EngineFree) and empties the
+    // array. Only for an array the engine filled for the caller. Never for a
+    // view of memory something else owns (a member of a live object, a wrapped
+    // literal); that is also why there is no destructor.
+    void FreeEngineData() {
+        EngineFree(const_cast<void*>(static_cast<const void*>(Data)));
+        Data = nullptr;
+        Num = 0;
+        Max = 0;
+    }
+};
+static_assert(sizeof(TArray<uint8>) == 0x10, "TArray layout must stay 16 bytes");
+
+template<class K, class V>
+struct TPair {
+    K Key;
+    V Value;
+};
+
+)SDK";
+    if (typedSets) {
+        f << R"SDK(// TBitArray with the default allocator: four inline words, heap storage beyond.
+struct FBitArray {
+    uint32 InlineData[4] = {};
+    uint32* SecondaryData = nullptr;
+    int32 NumBits = 0;
+    int32 MaxBits = 0;
+
+    const uint32* GetData() const { return SecondaryData ? SecondaryData : InlineData; }
+    bool operator[](int32 Index) const {
+        return Index >= 0 && Index < NumBits &&
+               (GetData()[Index / 32] & (1u << (Index % 32))) != 0;
+    }
+};
+static_assert(sizeof(FBitArray) == 0x20, "FBitArray layout must stay 32 bytes");
+
+// One slot of a TSet: the value, then the links of its hash bucket.
+template<class T>
+struct TSetElement {
+    T Value;
+    int32 HashNextId;
+    int32 HashIndex;
+};
+
+// TSparseArray: live elements and free slots share Data, and AllocationFlags
+// has a set bit for each live slot.
+template<class T>
+struct TSparseArray {
+    TArray<T> Data;
+    FBitArray AllocationFlags;
+    int32 FirstFreeIndex = -1;
+    int32 NumFreeIndices = 0;
+
+    int32 Num() const { return Data.Num - NumFreeIndices; }
+    int32 GetMaxIndex() const { return Data.Num; }
+    bool IsAllocated(int32 Index) const {
+        return Index >= 0 && Index < Data.Num && AllocationFlags[Index];
+    }
+};
+static_assert(sizeof(TSparseArray<int32>) == 0x38, "TSparseArray layout must stay 56 bytes");
+
+template<class T>
+struct TSet {
+    using ElementType = TSetElement<T>;
+
+    TSparseArray<ElementType> Elements;
+    int32 InlineHash = -1;           // the one inline bucket
+    int32* SecondaryHash = nullptr;  // heap buckets, used when HashSize > 1
+    int32 HashSize = 0;
+
+    static constexpr int32 InlineSize = 0x50;
+    constexpr int32 RawSize() const { return InlineSize; }
+    constexpr bool IsOpaque() const { return false; }
+    int32 Num() const { return Elements.Num(); }
+    int32 Count() const { return Num(); }
+    bool IsEmpty() const { return Num() <= 0; }
+    bool IsValid() const { return Elements.Data.Num >= 0 && Elements.Data.Max >= Elements.Data.Num; }
+
+    // Visits the live elements; free slots are skipped.
+    template<class SetType, class ValueType>
+    struct TIterator {
+        SetType* Set = nullptr;
+        int32 Index = 0;
+        void SkipFree() {
+            while (Index < Set->Elements.GetMaxIndex() && !Set->Elements.IsAllocated(Index)) ++Index;
+        }
+        ValueType& operator*() const { return Set->Elements.Data.Data[Index].Value; }
+        TIterator& operator++() { ++Index; SkipFree(); return *this; }
+        bool operator!=(const TIterator& Other) const { return Index != Other.Index; }
+    };
+    using Iterator = TIterator<TSet, T>;
+    using ConstIterator = TIterator<const TSet, const T>;
+    Iterator begin() { Iterator It{ this, 0 }; It.SkipFree(); return It; }
+    Iterator end() { return Iterator{ this, Elements.GetMaxIndex() }; }
+    ConstIterator begin() const { ConstIterator It{ this, 0 }; It.SkipFree(); return It; }
+    ConstIterator end() const { return ConstIterator{ this, Elements.GetMaxIndex() }; }
+
+    // Linear search: using the hash would need the engine's GetTypeHash for T.
+    const T* Find(const T& Value) const {
+        for (const T& Each : *this) if (Each == Value) return &Each;
+        return nullptr;
+    }
+    bool Contains(const T& Value) const { return Find(Value) != nullptr; }
+};
+static_assert(sizeof(TSet<uint8>) == 0x50, "TSet layout must stay 80 bytes");
+
+template<class K, class V>
+struct TMap {
+    using ElementType = TPair<K, V>;
+
+    TSet<ElementType> Pairs;
+
+    static constexpr int32 InlineSize = 0x50;
+    constexpr int32 RawSize() const { return InlineSize; }
+    constexpr bool IsOpaque() const { return false; }
+    int32 Num() const { return Pairs.Num(); }
+    int32 Count() const { return Num(); }
+    bool IsEmpty() const { return Num() <= 0; }
+    bool IsValid() const { return Pairs.IsValid(); }
+
+    auto begin() { return Pairs.begin(); }
+    auto end() { return Pairs.end(); }
+    auto begin() const { return Pairs.begin(); }
+    auto end() const { return Pairs.end(); }
+
+    // Linear search, for the same reason as TSet::Find.
+    V* Find(const K& Key) {
+        for (ElementType& Each : *this) if (Each.Key == Key) return &Each.Value;
+        return nullptr;
+    }
+    const V* Find(const K& Key) const {
+        for (const ElementType& Each : *this) if (Each.Key == Key) return &Each.Value;
+        return nullptr;
+    }
+    bool Contains(const K& Key) const { return Find(Key) != nullptr; }
+};
+static_assert(sizeof(TMap<uint8, uint8>) == 0x50, "TMap layout must stay 80 bytes");
+
+)SDK";
+    } else {
+        // Opaque: the template arguments only document the element types.
+        f << "template<class T>\n";
+        f << "struct TSet {\n";
+        f << "    uint8 Data[" << Hex32(g_detectedSizes.set) << "]{};\n";
+        f << "    static constexpr int32 InlineSize = " << Hex32(g_detectedSizes.set) << ";\n";
+        f << "    constexpr int32 RawSize() const { return InlineSize; }\n";
+        f << "    constexpr bool IsOpaque() const { return true; }\n";
+        f << "};\n";
+        f << "static_assert(sizeof(TSet<uint8>) == " << Hex32(g_detectedSizes.set)
+          << ", \"TSet opaque layout size mismatch\");\n\n";
+        f << "template<class K, class V>\n";
+        f << "struct TMap {\n";
+        f << "    uint8 Data[" << Hex32(g_detectedSizes.map) << "]{};\n";
+        f << "    static constexpr int32 InlineSize = " << Hex32(g_detectedSizes.map) << ";\n";
+        f << "    constexpr int32 RawSize() const { return InlineSize; }\n";
+        f << "    constexpr bool IsOpaque() const { return true; }\n";
+        f << "};\n";
+        f << "static_assert(sizeof(TMap<uint8, uint8>) == " << Hex32(g_detectedSizes.map)
+          << ", \"TMap opaque layout size mismatch\");\n\n";
+    }
+
+    f << R"SDK(struct FString : public TArray<TCHAR> {
+    using TArray<TCHAR>::TArray;
+    const TCHAR* CStr() const { return Data ? Data : u""; }
+    // Characters before the terminator (Num counts the terminator).
+    int32 Len() const { return Num > 0 ? Num - 1 : 0; }
+    // The text as UTF-8.
+    std::string ToString() const {
+        std::string Out;
+        const int32 Length = Data ? Len() : 0;
+        Out.reserve(static_cast<std::size_t>(Length));
+        for (int32 i = 0; i < Length; ++i) {
+            uint32 Code = static_cast<uint16>(Data[i]);
+            if (Code == 0) break;
+            if (Code >= 0xD800 && Code <= 0xDBFF && i + 1 < Length) {
+                const uint32 Low = static_cast<uint16>(Data[i + 1]);
+                if (Low >= 0xDC00 && Low <= 0xDFFF) {
+                    Code = 0x10000 + ((Code - 0xD800) << 10) + (Low - 0xDC00);
+                    ++i;
+                }
+            }
+            if (Code < 0x80) {
+                Out.push_back(static_cast<char>(Code));
+            } else if (Code < 0x800) {
+                Out.push_back(static_cast<char>(0xC0 | (Code >> 6)));
+                Out.push_back(static_cast<char>(0x80 | (Code & 0x3F)));
+            } else if (Code < 0x10000) {
+                Out.push_back(static_cast<char>(0xE0 | (Code >> 12)));
+                Out.push_back(static_cast<char>(0x80 | ((Code >> 6) & 0x3F)));
+                Out.push_back(static_cast<char>(0x80 | (Code & 0x3F)));
+            } else {
+                Out.push_back(static_cast<char>(0xF0 | (Code >> 18)));
+                Out.push_back(static_cast<char>(0x80 | ((Code >> 12) & 0x3F)));
+                Out.push_back(static_cast<char>(0x80 | ((Code >> 6) & 0x3F)));
+                Out.push_back(static_cast<char>(0x80 | (Code & 0x3F)));
+            }
+        }
+        return Out;
+    }
+};
+static_assert(sizeof(FString) == 0x10, "FString layout must stay 16 bytes");
+
+)SDK";
+    if (typedText) {
+        f << R"SDK(struct FText {
+    void* TextData = nullptr;             // ITextData*, the object of a TSharedRef
+    void* ReferenceController = nullptr;  // that TSharedRef's reference counter
+    uint32 Flags = 0;
+    uint8 Pad_14[0x4] = {};
+};
+static_assert(sizeof(FText) == 0x18, "FText layout must stay 24 bytes");
+
+)SDK";
+    } else {
+        EmitOpaqueType(f, "FText", g_detectedSizes.text);
+    }
+
+    f << R"SDK(struct FWeakObjectPtr {
+    int32 ObjectIndex = 0;
+    int32 ObjectSerialNumber = 0;
+
+    // The object, or null once it is gone: its slot in the object array must
+    // still carry the serial number this pointer was made with.
+    class UObject* Get() const {
+        if (ObjectSerialNumber == 0 || ObjectIndex < 0 || !SDK::GObjects) return nullptr;
+        FUObjectItem* Item = SDK::GObjects->GetItemByIndex(ObjectIndex);
+        return (Item && Item->SerialNumber == ObjectSerialNumber) ? Item->Object : nullptr;
+    }
+    bool IsValid() const { return Get() != nullptr; }
+    bool operator==(const FWeakObjectPtr& Other) const {
+        return ObjectIndex == Other.ObjectIndex && ObjectSerialNumber == Other.ObjectSerialNumber;
+    }
+    bool operator!=(const FWeakObjectPtr& Other) const { return !(*this == Other); }
+};
+static_assert(sizeof(FWeakObjectPtr) == 0x8, "FWeakObjectPtr layout must stay 8 bytes");
+
+template<class T>
+struct TWeakObjectPtr : public FWeakObjectPtr {
+    using ElementType = T;
+    T* Get() const { return reinterpret_cast<T*>(FWeakObjectPtr::Get()); }
+};
+
+)SDK";
+    if (typedLazy) {
+        f << R"SDK(// TLazyObjectPtr: a weak pointer the engine caches, and the object's GUID.
+struct FLazyObjectPtr {
+    FWeakObjectPtr WeakPtr;
+    int32 TagAtLastTest = 0;
+    uint32 Guid[4] = {};  // FUniqueObjectGuid
+
+    // The object if the engine has already resolved it; this does not search by GUID.
+    class UObject* Get() const { return WeakPtr.Get(); }
+};
+static_assert(sizeof(FLazyObjectPtr) == 0x1C, "FLazyObjectPtr layout must stay 28 bytes");
+
+template<class T>
+struct TLazyObjectPtr : public FLazyObjectPtr {
+    using ElementType = T;
+    T* Get() const { return reinterpret_cast<T*>(FLazyObjectPtr::Get()); }
+};
+
+)SDK";
+    } else {
+        EmitOpaqueType(f, "FLazyObjectPtr", g_detectedSizes.lazyObjectPtr);
+        f << R"SDK(template<class T> struct TLazyObjectPtr : public FLazyObjectPtr { using ElementType = T; };
+
+)SDK";
+    }
+
+    f << R"SDK(template<class T>
+struct TSubclassOf {
+    class UClass* Class = nullptr;
+    constexpr TSubclassOf() = default;
+    constexpr TSubclassOf(class UClass* InClass) : Class(InClass) {}
+    constexpr operator class UClass*() const { return Class; }
+    constexpr class UClass* operator->() const { return Class; }
+    constexpr bool operator==(const TSubclassOf& Other) const { return Class == Other.Class; }
+    constexpr bool operator!=(const TSubclassOf& Other) const { return Class != Other.Class; }
+};
+
+struct FScriptInterface {
+    class UObject* ObjectPointer = nullptr;
+    void* InterfacePointer = nullptr;
+};
+static_assert(sizeof(FScriptInterface) == 0x10, "FScriptInterface layout must stay 16 bytes");
+template<class T>
+struct TScriptInterface : public FScriptInterface { using InterfaceType = T; };
+
+)SDK";
+    if (typedDelegate) {
+        f << R"SDK(// A single-cast delegate: the object and the name of the function to call on it.
+struct FScriptDelegate {
+    FWeakObjectPtr Object;
+    FName FunctionName;
+
+    bool IsBound() const { return !FunctionName.IsNone() && Object.IsValid(); }
+};
+static_assert(sizeof(FScriptDelegate) == 0x10, "FScriptDelegate layout must stay 16 bytes");
+
+)SDK";
+    } else {
+        EmitOpaqueType(f, "FScriptDelegate", g_detectedSizes.scriptDelegate);
+    }
+    if (typedMulticast) {
+        f << R"SDK(struct FMulticastScriptDelegate {
+    TArray<FScriptDelegate> InvocationList;
+
+    bool IsBound() const { return InvocationList.Num > 0; }
+};
+static_assert(sizeof(FMulticastScriptDelegate) == 0x10, "FMulticastScriptDelegate layout must stay 16 bytes");
+
+)SDK";
+    } else {
+        EmitOpaqueType(f, "FMulticastScriptDelegate", g_detectedSizes.multicastScriptDelegate);
+    }
+    EmitOpaqueType(f, "FMulticastSparseDelegate", g_detectedSizes.multicastSparseDelegate);
+
+    if (typedSoft) {
+        f << R"SDK(// TSoftObjectPtr: the asset's path, and a weak pointer the engine caches once
+// the asset is loaded.
+struct FSoftObjectPtr {
+    FWeakObjectPtr WeakPtr;
+    int32 TagAtLastTest = 0;
+    uint8 Pad_C[0x4] = {};
+    FName AssetPathName;    // FSoftObjectPath::AssetPathName
+    FString SubPathString;  // FSoftObjectPath::SubPathString
+
+    bool IsNull() const { return AssetPathName.IsNone(); }
+    // The object if it is loaded and the engine has resolved this pointer
+    // before; this does not load or search.
+    class UObject* Get() const { return WeakPtr.Get(); }
+};
+static_assert(sizeof(FSoftObjectPtr) == 0x28, "FSoftObjectPtr layout must stay 40 bytes");
+template<class T>
+struct TSoftObjectPtr : public FSoftObjectPtr {
+    T* Get() const { return reinterpret_cast<T*>(FSoftObjectPtr::Get()); }
+};
+template<class T> struct TSoftClassPtr : public FSoftObjectPtr {};
+
+)SDK";
+    } else {
+        EmitOpaqueType(f, "FSoftObjectPtr", g_detectedSizes.softObjectPtr);
+        f << R"SDK(template<class T> struct TSoftObjectPtr : public FSoftObjectPtr {};
+template<class T> struct TSoftClassPtr : public FSoftObjectPtr {};
+
+)SDK";
+    }
+
+    if (typedAsset) {
+        f << R"SDK(// TAssetPtr / TAssetSubclassOf: the soft references of 4.17 and older (renamed
+// TSoftObjectPtr / TSoftClassPtr in 4.18, when the path became an FName plus a
+// sub-path). The path is FStringAssetReference, one FString.
+struct FAssetPtr {
+    FWeakObjectPtr WeakPtr;
+    int32 TagAtLastTest = 0;
+    uint8 Pad_C[0x4] = {};
+    FString AssetLongPathname;  // FStringAssetReference
+
+    bool IsNull() const { return AssetLongPathname.Len() == 0; }
+    // The object if it is loaded and the engine has resolved this pointer
+    // before; this does not load or search.
+    class UObject* Get() const { return WeakPtr.Get(); }
+};
+static_assert(sizeof(FAssetPtr) == 0x20, "FAssetPtr layout must stay 32 bytes");
+template<class T>
+struct TAssetPtr : public FAssetPtr {
+    T* Get() const { return reinterpret_cast<T*>(FAssetPtr::Get()); }
+};
+template<class T> struct TAssetSubclassOf : public FAssetPtr {};
+
+)SDK";
+    } else {
+        EmitOpaqueType(f, "FAssetPtr", g_detectedSizes.assetPtr);
+        f << R"SDK(template<class T> struct TAssetPtr : public FAssetPtr {};
+template<class T> struct TAssetSubclassOf : public FAssetPtr {};
+
+)SDK";
+    }
+
+    if (typedFieldPath) {
+        f << R"SDK(// TFieldPath: a property found by name inside its owner struct.
+struct FFieldPath {
+    void* ResolvedField = nullptr;  // FField*
+    FWeakObjectPtr ResolvedOwner;   // TWeakObjectPtr<UStruct>
+    TArray<FName> Path;
+};
+static_assert(sizeof(FFieldPath) == 0x20, "FFieldPath layout must stay 32 bytes");
+
+)SDK";
+    } else {
+        EmitOpaqueType(f, "FFieldPath", g_detectedSizes.fieldPath);
+    }
+
     f << "}  // namespace SDK\n";
     return true;
 }
@@ -3725,6 +4711,20 @@ INTERNAL bool EmitCoreUObjectFields(std::ofstream& f,
         f << "        }\n";
         f << "        return false;\n";
         f << "    }\n";
+        f << R"SDK(    // IsA by class name, for a class that may not be loaded yet (a Blueprint's
+    // "_C" class): the same walk up the super chain, comparing names.
+    bool IsAByName(const FName& ClassName) const {
+        for (class UClass* Current = Class; Current; ) {
+            if (reinterpret_cast<const UObject*>(Current)->Name == ClassName) return true;
+            Current = *reinterpret_cast<class UClass**>(reinterpret_cast<std::uintptr_t>(Current) + SDKOffsets::UStructSuperStruct);
+        }
+        return false;
+    }
+    bool IsAByName(const char* ClassName) const {
+        const FName Target(ClassName);
+        return !Target.IsNone() && IsAByName(Target);
+    }
+)SDK";
         f << "    static class UClass* GetClassClass() {\n";
         f << "        static class UClass* CachedClassClass = nullptr;\n";
         f << "        if (CachedClassClass || !SDK::GObjects) return CachedClassClass;\n";
@@ -3865,11 +4865,19 @@ INTERNAL bool EmitCoreUObjectFields(std::ofstream& f,
     } else if (name == "Struct") {
         EmitKnownCoreField(f, cursor, Off::UStruct::SuperStruct, sizeof(void*), "class UStruct*", "SuperStruct");
         EmitKnownCoreField(f, cursor, Off::UStruct::Children, sizeof(void*), "class UField*", "Children");
-        EmitKnownCoreField(f, cursor, Off::UStruct::ChildProperties, sizeof(void*), "void*", "ChildProperties");
+        if (Off::UStruct::ChildProperties >= 0) {
+            EmitKnownCoreField(f, cursor, Off::UStruct::ChildProperties, sizeof(void*), "void*", "ChildProperties");
+        }
         EmitKnownCoreField(f, cursor, Off::UStruct::PropertiesSize, 4, "int32", "PropertiesSize");
         EmitKnownCoreField(f, cursor, Off::UStruct::MinAlignment, 4, "int32", "MinAlignment");
     } else if (name == "Class") {
-        EmitKnownCoreField(f, cursor, Off::UClass::ClassFlags, 4, "uint32", "ClassFlags");
+        // Written only where ResolveClassFlags found them in this build.
+        if (g_classFlagsKnown) {
+            EmitKnownCoreField(f, cursor, Off::UClass::ClassFlags, 4, "uint32", "ClassFlags");
+        }
+        if (g_classCastFlagsOffset >= 0) {
+            EmitKnownCoreField(f, cursor, g_classCastFlagsOffset, 8, "uint64", "ClassCastFlags");
+        }
         EmitKnownCoreField(f, cursor, Off::UClass::ClassDefaultObject, sizeof(void*), "class UObject*", "ClassDefaultObject");
         f << "    class UObject* GetDefaultObject() const { return ClassDefaultObject; }\n";
         f << "    template<class T> T* GetDefaultObject() const { return reinterpret_cast<T*>(ClassDefaultObject); }\n";
@@ -3917,12 +4925,11 @@ INTERNAL bool EmitCoreUObjectFields(std::ofstream& f,
 INTERNAL void EmitInheritance(
         std::ofstream& f,
         const ObjMeta* m,
-        char prefix,
         const std::unordered_map<uintptr_t, const ObjMeta*>& byAddr) noexcept {
     if (m->superStruct == 0) return;
     auto sit = byAddr.find(m->superStruct);
     if (sit == byAddr.end()) return;
-    f << " : public " << prefix << SanitizeIdent(sit->second->name);
+    f << " : public " << CppNameOf(*sit->second);
 }
 
 INTERNAL int32_t BaseSizeOf(
@@ -4114,7 +5121,7 @@ INTERNAL bool WritePackageEnumsHeader(
     for (auto a : pkg.enums) {
         auto it = byAddr.find(a);
         if (it == byAddr.end()) continue;
-        std::string typeName = "E" + SanitizeIdent(it->second->name);
+        std::string typeName = CppNameOf(*it->second);
         if (!emittedTypes.enums.insert(typeName).second) {
             DLOGW("[sdk] skipped duplicate enum %s in package %s",
                   typeName.c_str(), pkg.name.c_str());
@@ -4171,12 +5178,13 @@ INTERNAL bool WritePackageStructsHeader(
         if (it->second.name == pkg.name) continue;
         f << "#include \"" << it->second.name << "_structs.hpp\"\n";
     }
+    OpenOffsetofScope(f);
     f << "\nnamespace SDK {\n\n";
 
     for (auto a : OrderedPackageStructs(pkg, byAddr, propsByStruct)) {
         auto it = byAddr.find(a);
         if (it == byAddr.end()) continue;
-        std::string typeName = "F" + SanitizeIdent(it->second->name);
+        std::string typeName = CppNameOf(*it->second);
         if (!emittedTypes.structs.insert(typeName).second) {
             DLOGW("[sdk] skipped duplicate struct %s in package %s",
                   typeName.c_str(), pkg.name.c_str());
@@ -4195,18 +5203,23 @@ INTERNAL bool WritePackageStructsHeader(
         } else {
             f << "struct " << typeName;
         }
-        EmitInheritance(f, it->second, 'F', byAddr);
+        EmitInheritance(f, it->second, byAddr);
         f << " {\n";
         auto pit = propsByStruct.find(a);
         const std::vector<PropertyInfo>& props =
                 pit != propsByStruct.end()
                         ? pit->second
                         : CachedProperties(a, propsByStruct, byAddr, fieldClassCache);
-        EmitFields(f, props, BaseSizeOf(it->second, byAddr), it->second->propertiesSize);
-        f << "};\n\n";
+        PlacedMembers placed;
+        EmitFields(f, props, BaseSizeOf(it->second, byAddr), it->second->propertiesSize, &placed);
+        f << "};\n";
+        EmitLayoutAsserts(f, typeName, it->second->propertiesSize,
+                          it->second->minAlignment, true, placed);
+        f << "\n";
     }
 
     f << "}  // namespace SDK\n";
+    CloseOffsetofScope(f);
     return true;
 }
 
@@ -4264,12 +5277,13 @@ INTERNAL bool WritePackageClassesHeader(
         if (it->second.name == pkg.name) continue;
         f << "#include \"" << it->second.name << "_classes.hpp\"\n";
     }
+    OpenOffsetofScope(f);
     f << "\nnamespace SDK {\n\n";
 
     for (auto a : OrderedPackageClasses(pkg, byAddr)) {
         auto it = byAddr.find(a);
         if (it == byAddr.end()) continue;
-        std::string typeName = "U" + SanitizeIdent(it->second->name);
+        std::string typeName = CppNameOf(*it->second);
         if (!emittedTypes.classes.insert(typeName).second) {
             DLOGW("[sdk] skipped duplicate class %s in package %s",
                   typeName.c_str(), pkg.name.c_str());
@@ -4280,14 +5294,14 @@ INTERNAL bool WritePackageClassesHeader(
                 : pkg.displayName + "." + it->second->name;
         // Class comment with flags
         std::string classTagStr;
-        uint32_t cf = it->second->classFlags;
-        if (cf & 0x00000001) classTagStr += "Abstract,";
-        if (cf & 0x00004000) classTagStr += "Interface,";
-        if (cf & 0x00000004) classTagStr += "Config,";
-        if (cf & 0x00000008) classTagStr += "Transient,";
-        if (cf & 0x00000080) classTagStr += "Native,";
-        if (cf & 0x02000000) classTagStr += "Deprecated,";
-        if (cf & 0x00040000) classTagStr += "BlueprintType,";
+        const uint32_t cf = g_classFlagsKnown ? it->second->classFlags : 0;
+        if (cf & CLASS_Abstract)              classTagStr += "Abstract,";
+        if (cf & CLASS_Interface)             classTagStr += "Interface,";
+        if (cf & CLASS_Config)                classTagStr += "Config,";
+        if (cf & CLASS_Transient)             classTagStr += "Transient,";
+        if (cf & CLASS_Native)                classTagStr += "Native,";
+        if (cf & CLASS_Deprecated)            classTagStr += "Deprecated,";
+        if (cf & CLASS_CompiledFromBlueprint) classTagStr += "Blueprint,";
         if (!classTagStr.empty()) classTagStr.pop_back(); // trailing comma
         f << "// Class " << classFullName;
         if (!classTagStr.empty()) f << " [" << classTagStr << "]";
@@ -4300,7 +5314,7 @@ INTERNAL bool WritePackageClassesHeader(
         }
         f << "\n";
         f << "class " << typeName;
-        EmitInheritance(f, it->second, 'U', byAddr);
+        EmitInheritance(f, it->second, byAddr);
         f << " {\npublic:\n";
         f << "    static class UClass* StaticClass() {\n";
         f << "        static class UClass* Class = nullptr;\n";
@@ -4313,13 +5327,16 @@ INTERNAL bool WritePackageClassesHeader(
         f << "        return Class ? reinterpret_cast<" << typeName
           << "*>(UObject::GetClassDefaultObject(Class)) : nullptr;\n";
         f << "    }\n";
+        PlacedMembers placed;
+        bool checkLayout = false;
         if (!EmitCoreUObjectFields(f, *it->second, BaseSizeOf(it->second, byAddr))) {
+            checkLayout = true;
             auto pit = propsByClass.find(a);
             const std::vector<PropertyInfo>& props =
                     pit != propsByClass.end()
                             ? pit->second
                             : CachedProperties(a, propsByClass, byAddr, fieldClassCache);
-            EmitFields(f, props, BaseSizeOf(it->second, byAddr), it->second->propertiesSize);
+            EmitFields(f, props, BaseSizeOf(it->second, byAddr), it->second->propertiesSize, &placed);
             auto fit = funcsByClass.find(a);
             const std::vector<FunctionInfo>& funcs =
                     fit != funcsByClass.end()
@@ -4338,10 +5355,16 @@ INTERNAL bool WritePackageClassesHeader(
                             : CachedFunctions(a, funcsByClass, byAddr, fieldClassCache);
             EmitFunctions(f, funcs);
         }
-        f << "};\n\n";
+        f << "};\n";
+        if (checkLayout) {
+            EmitLayoutAsserts(f, typeName, it->second->propertiesSize,
+                              it->second->minAlignment, false, placed);
+        }
+        f << "\n";
     }
 
     f << "}  // namespace SDK\n";
+    CloseOffsetofScope(f);
     return true;
 }
 
@@ -4383,17 +5406,7 @@ INTERNAL void EmitParamStructBody(std::ofstream& f,
                   << "[0x" << (byteOffset - cursor) << "];" << std::dec << "\n";
                 cursor = byteOffset;
             }
-            while (i < props.size() &&
-                   props[i].isBitfield &&
-                   props[i].offset == byteOffset) {
-                const auto& bp = props[i];
-                std::string name = emitName(bp);
-                f << "    uint8_t " << name
-                  << " : 1;  // 0x" << std::hex << std::uppercase
-                  << bp.offset << " (mask=0x" << (int)bp.boolMask
-                  << ", size=0x1)" << std::dec << "\n";
-                ++i;
-            }
+            EmitBitfieldByte(f, props, i, emitName);
             cursor = byteOffset + 1;
             continue;
         }
@@ -4503,12 +5516,14 @@ INTERNAL bool WritePackageParametersHeader(
         f << "#include \"" << it->second.name << "_structs.hpp\"\n";
     }
 
+    OpenOffsetofScope(f);
     f << "\nnamespace SDK {\n";
     f << "namespace Params {\n\n";
 
     if (!any) {
         f << "}  // namespace Params\n";
         f << "}  // namespace SDK\n";
+        CloseOffsetofScope(f);
         return true;
     }
 
@@ -4517,7 +5532,7 @@ INTERNAL bool WritePackageParametersHeader(
         if (it == byAddr.end()) continue;
         auto fit = funcsByClass.find(a);
         if (fit == funcsByClass.end() || fit->second.empty()) continue;
-        std::string className = "U" + SanitizeIdent(it->second->name);
+        std::string className = CppNameOf(*it->second);
         for (const auto& fn : fit->second) {
             if (fn.name.empty()) continue;
             if (fn.params.empty() && !fn.hasReturnParam) continue;
@@ -4574,6 +5589,7 @@ INTERNAL bool WritePackageParametersHeader(
 
     f << "}  // namespace Params\n";
     f << "}  // namespace SDK\n";
+    CloseOffsetofScope(f);
     return true;
 }
 
@@ -4640,7 +5656,7 @@ INTERNAL bool WritePackageFunctionsCpp(
         if (it == byAddr.end()) continue;
         auto fit = funcsByClass.find(a);
         if (fit == funcsByClass.end() || fit->second.empty()) continue;
-        std::string className = "U" + SanitizeIdent(it->second->name);
+        std::string className = CppNameOf(*it->second);
         for (const auto& fn : fit->second) {
             EmitFunctionImpl(f, className, fn);
         }
@@ -5021,7 +6037,130 @@ INTERNAL bool WriteOffsetsLog(const std::string& rootDir) noexcept {
     f << "UFunction.NumParms = " << Hex32(Off::UFunction::NumParms) << "\n";
     f << "UFunction.Func = " << Hex32(Off::UFunction::Func) << "\n\n";
     f << "# Auto-detected non-reflected offsets (-1 = not found)\n";
-    f << "ULevel.Actors = " << Hex32(Off::AutoDetected::ULevelActors) << "\n";
+    f << "ULevel.Actors = "
+      << (Off::AutoDetected::ULevelActors >= 0 ? Hex32(Off::AutoDetected::ULevelActors)
+                                               : std::string("-1"))
+      << "\n";
+    return true;
+}
+
+// JSON string literal for a name that comes from the game.
+INTERNAL std::string JsonString(const std::string& s) noexcept {
+    std::string out = "\"";
+    for (unsigned char c : s) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += static_cast<char>(c);
+        } else if (c < 0x20) {
+            char b[8];
+            std::snprintf(b, sizeof(b), "\\u%04x", c);
+            out += b;
+        } else {
+            out += static_cast<char>(c);
+        }
+    }
+    out += '"';
+    return out;
+}
+
+// Mappings.json: every class and struct with its size, C++ name, super and
+// member offsets, and every native function with its offset, for scripts.
+//   "members":   name -> byte offset (bit-field bools are not in here)
+//   "bitfields": name -> [byte offset, bit mask]
+// A member name that occurs twice in one type is numbered the way the headers
+// number it (Name_1, Name_2).
+INTERNAL bool WriteMappingsJson(
+        const std::vector<uintptr_t>& order,
+        const std::unordered_map<uintptr_t, PackageInfo>& packages,
+        const std::unordered_map<uintptr_t, const ObjMeta*>& byAddr,
+        std::unordered_map<uintptr_t, std::string>& fieldClassCache,
+        const std::string& rootDir) noexcept {
+    std::ofstream jf(JoinPath(rootDir, "Mappings.json"));
+    if (!jf) return false;
+
+    auto writeType = [&](const ObjMeta& m, const PackageInfo& pkg) {
+        jf << "    " << JsonString(m.name) << ": {"
+           << "\"size\": " << m.propertiesSize
+           << ", \"package\": " << JsonString(pkg.name)
+           << ", \"cpp\": " << JsonString(CppNameOf(m));
+        auto sit = byAddr.find(m.superStruct);
+        if (sit != byAddr.end()) jf << ", \"super\": " << JsonString(sit->second->name);
+
+        const auto props = CollectStructProperties(m.address, byAddr, fieldClassCache);
+        std::unordered_map<std::string, int32_t> total, next;
+        for (const auto& p : props) if (!p.name.empty()) ++total[p.name];
+        std::string members, bitfields;
+        for (const auto& p : props) {
+            if (p.name.empty()) continue;
+            std::string name = p.name;
+            if (total[name] > 1) name += "_" + std::to_string(++next[p.name]);
+            std::string& out = p.isBitfield ? bitfields : members;
+            if (!out.empty()) out += ", ";
+            out += JsonString(name) + ": ";
+            if (p.isBitfield) {
+                out += "[" + std::to_string(p.offset) + ", " + std::to_string(p.boolMask) + "]";
+            } else {
+                out += std::to_string(p.offset);
+            }
+        }
+        if (!members.empty())   jf << ", \"members\": {" << members << "}";
+        if (!bitfields.empty()) jf << ", \"bitfields\": {" << bitfields << "}";
+        jf << "}";
+    };
+
+    auto writeTypes = [&](const char* key, bool classes) {
+        jf << "  \"" << key << "\": {\n";
+        bool first = true;
+        for (uintptr_t pkgAddr : order) {
+            auto pit = packages.find(pkgAddr);
+            if (pit == packages.end()) continue;
+            for (auto a : (classes ? pit->second.classes : pit->second.structs)) {
+                auto it = byAddr.find(a);
+                if (it == byAddr.end()) continue;
+                if (!first) jf << ",\n";
+                first = false;
+                writeType(*it->second, pit->second);
+            }
+        }
+        jf << "\n  },\n";
+    };
+
+    jf << "{\n";
+    jf << "  \"engine\": " << JsonString(EngineVersionString()) << ",\n";
+    // Addresses in the process the dump ran in, and the same as library offsets.
+    jf << "  \"libBase\": \"" << HexPtr(CurrentLibBase()) << "\",\n";
+    jf << "  \"GObjects\": \"" << HexPtr(Off::Resolved::GObjects) << "\",\n";
+    jf << "  \"GNames\": \"" << HexPtr(Off::Resolved::GNames) << "\",\n";
+    jf << "  \"GWorld\": \"" << HexPtr(Off::Resolved::GWorld) << "\",\n";
+    jf << "  \"ProcessEvent\": \"" << HexPtr(Off::Resolved::ProcessEvent) << "\",\n";
+    jf << "  \"offsets\": {"
+       << "\"GObjects\": \"" << HexPtr(OffsetFromLibBase(Off::Resolved::GObjects)) << "\", "
+       << "\"GNames\": \"" << HexPtr(OffsetFromLibBase(Off::Resolved::GNames)) << "\", "
+       << "\"GWorld\": \"" << HexPtr(OffsetFromLibBase(Off::Resolved::GWorld)) << "\", "
+       << "\"ProcessEvent\": \"" << HexPtr(OffsetFromLibBase(Off::Resolved::ProcessEvent)) << "\"},\n";
+    writeTypes("classes", true);
+    writeTypes("structs", false);
+
+    jf << "  \"functions\": {\n";
+    bool firstFunc = true;
+    for (uintptr_t pkgAddr : order) {
+        auto pit = packages.find(pkgAddr);
+        if (pit == packages.end()) continue;
+        for (auto a : pit->second.functions) {
+            FunctionInfo fn = BuildFunctionInfo(a, byAddr, fieldClassCache);
+            if (fn.nativeFuncPtr == 0) continue;
+            if (!firstFunc) jf << ",\n";
+            firstFunc = false;
+            jf << "    " << JsonString(GetFullFunctionName(a)) << ": {"
+               << "\"offset\": \"0x" << std::hex << std::uppercase
+               << (fn.nativeFuncPtr - Off::Resolved::LibBase) << "\""
+               << ", \"flags\": \"0x" << fn.functionFlags << std::dec << "\""
+               << ", \"package\": " << JsonString(pit->second.name)
+               << "}";
+        }
+    }
+    jf << "\n  }\n";
+    jf << "}\n";
     return true;
 }
 
@@ -5050,6 +6189,7 @@ INTERNAL bool WriteHeaders(const std::vector<uintptr_t>& order,
     std::unordered_map<uintptr_t, const ObjMeta*> byAddr;
     byAddr.reserve(metas.size());
     for (const auto& m : metas) byAddr[m.address] = &m;
+    BuildCppTypeNames(metas, packages);
 
     // FFieldClass* → class name (e.g., "IntProperty"). Shared across all
     // packages so we decode each FFieldClass.Name once per dump.
@@ -5142,89 +6282,8 @@ INTERNAL bool WriteHeaders(const std::vector<uintptr_t>& order,
         SetError("Failed writing Functions.log / SDKRename scripts");
         return false;
     }
-    // Write a machine-readable JSON mapping of all classes/structs with their
-    // sizes and member offsets, plus all native functions and their offsets.
-    {
-        std::string fname = JoinPath(rootDir, "Mappings.json");
-        std::ofstream jf(fname);
-        if (jf) {
-            jf << "{\n";
-            jf << "  \"engine\": \"" << EngineVersionString() << "\",\n";
-            jf << "  \"libBase\": \"" << HexPtr(CurrentLibBase()) << "\",\n";
-            jf << "  \"GObjects\": \"" << HexPtr(Off::Resolved::GObjects) << "\",\n";
-            jf << "  \"GNames\": \"" << HexPtr(Off::Resolved::GNames) << "\",\n";
-            jf << "  \"GWorld\": \"" << HexPtr(Off::Resolved::GWorld) << "\",\n";
-            jf << "  \"ProcessEvent\": \"" << HexPtr(Off::Resolved::ProcessEvent) << "\",\n";
-            jf << "  \"classes\": {\n";
-            bool firstClass = true;
-            for (uintptr_t pkgAddr : order) {
-                auto pit = packages.find(pkgAddr);
-                if (pit == packages.end()) continue;
-                for (auto a : pit->second.classes) {
-                    auto cit = byAddr.find(a);
-                    if (cit == byAddr.end()) continue;
-                    if (!firstClass) jf << ",\n";
-                    firstClass = false;
-                    // Collect members for JSON output
-                    auto props = CollectStructProperties(a, byAddr, fieldClassCache);
-                    jf << "    \"" << cit->second->name << "\": {"
-                       << "\"size\": " << cit->second->propertiesSize
-                       << ", \"package\": \"" << pit->second.name << "\"";
-                    if (!props.empty()) {
-                        jf << ", \"members\": {";
-                        bool firstMem = true;
-                        for (const auto& p : props) {
-                            if (p.name.empty() || p.isBitfield) continue;
-                            if (!firstMem) jf << ", ";
-                            firstMem = false;
-                            jf << "\"" << p.name << "\": " << p.offset;
-                        }
-                        jf << "}";
-                    }
-                    jf << "}";
-                }
-            }
-            jf << "\n  },\n";
-            jf << "  \"structs\": {\n";
-            bool firstStruct = true;
-            for (uintptr_t pkgAddr : order) {
-                auto pit = packages.find(pkgAddr);
-                if (pit == packages.end()) continue;
-                for (auto a : pit->second.structs) {
-                    auto sit = byAddr.find(a);
-                    if (sit == byAddr.end()) continue;
-                    if (!firstStruct) jf << ",\n";
-                    firstStruct = false;
-                    jf << "    \"" << sit->second->name << "\": {"
-                       << "\"size\": " << sit->second->propertiesSize
-                       << ", \"package\": \"" << pit->second.name << "\""
-                       << "}";
-                }
-            }
-            jf << "\n  },\n";
-            jf << "  \"functions\": {\n";
-            bool firstFunc = true;
-            for (uintptr_t pkgAddr : order) {
-                auto pit = packages.find(pkgAddr);
-                if (pit == packages.end()) continue;
-                for (auto a : pit->second.functions) {
-                    FunctionInfo fn = BuildFunctionInfo(a, byAddr, fieldClassCache);
-                    if (fn.nativeFuncPtr != 0) {
-                        if (!firstFunc) jf << ",\n";
-                        firstFunc = false;
-                        std::string fullPath = GetFullFunctionName(a);
-                        uintptr_t offset = fn.nativeFuncPtr - Off::Resolved::LibBase;
-                        jf << "    \"" << fullPath << "\": {"
-                           << "\"offset\": \"0x" << std::hex << std::uppercase << offset << std::dec << "\""
-                           << ", \"flags\": \"0x" << std::hex << std::uppercase << fn.functionFlags << std::dec << "\""
-                           << ", \"package\": \"" << pit->second.name << "\""
-                           << "}";
-                    }
-                }
-            }
-            jf << "\n  }\n";
-            jf << "}\n";
-        }
+    if (!WriteMappingsJson(order, packages, byAddr, fieldClassCache, rootDir)) {
+        DLOGW("[sdk] failed to write Mappings.json");
     }
     return true;
 }
@@ -5260,6 +6319,8 @@ INTERNAL void WorkerEntry(std::string outputDir) noexcept {
     }
     DLOGI("[sdk] Collected: %zu metas across %zu packages",
           metas.size(), packages.size());
+    ResolveClassFlags(metas);
+    ResolveFunctionLayout(metas);
 
     if (g_cancel.load()) {
         SetPhase(Phase::Cancelled);

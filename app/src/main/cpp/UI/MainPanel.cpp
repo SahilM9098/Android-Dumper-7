@@ -29,6 +29,7 @@
 
 #include <android/log.h>
 #include <fcntl.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 
 #include <dlfcn.h>
@@ -301,7 +302,8 @@ INTERNAL void CopyDiscovery(char* dst, size_t dstSize, const char* src) noexcept
     std::snprintf(dst, dstSize, "%s", src ? src : "");
 }
 
-std::string g_dumpDir = "/sdcard/Android/media/" + GetPackageName() + "/SDK";
+// SDKDumper writes into <this>/SDK.
+std::string g_dumpDir = "/sdcard/Android/media/" + GetPackageName();
 
 INTERNAL void ResetPipelineState() noexcept {
     std::lock_guard<std::mutex> lk(g_stateMu);
@@ -1014,6 +1016,19 @@ void Render() noexcept {
     ImGui::EndChild();
 
     ImGui::End();
+}
+
+void AutoStartIfRequested() noexcept {
+    char value[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.dumper7.autostart", value) <= 0) return;
+    const int delaySeconds = std::atoi(value);
+    if (delaySeconds <= 0) return;
+
+    DLOGI("[pipeline] autostart in %d s (debug.dumper7.autostart)", delaySeconds);
+    std::thread([delaySeconds] {
+        sleep(static_cast<unsigned>(delaySeconds));
+        StartPipeline();
+    }).detach();
 }
 
 }  // namespace MainPanel

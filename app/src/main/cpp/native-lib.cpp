@@ -463,6 +463,9 @@ static jboolean jni_nativeIsMenuVisible(JNIEnv *env, jclass clazz) {
 }
 
 static void *inject_thread(void *) {
+  // First, so a scripted dump still runs when the overlay cannot be set up.
+  MainPanel::AutoStartIfRequested();
+
   JavaVM *vm = ResolveJavaVm();
   if (vm == nullptr) {
     LogError("Failed to resolve JavaVM");
